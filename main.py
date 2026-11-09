@@ -17,6 +17,7 @@ from google.genai import types as genai_types
 from telebot import apihelper, types
 from telebot.handler_backends import BaseMiddleware, CancelUpdate
 
+from card_render import render_card, strip_markup
 from db import Database
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -77,31 +78,31 @@ busy_users: set[int] = set()
 FACTIONS = {
     "Nilfgaard": (
         "🛡 Нильфгаард", "Нильфгаард",
-        "A highly detailed dark fantasy portrait of a character, wearing heavy, ornate black and gold Nilfgaardian plate armor with a prominent sun emblem. The character exudes a stern, disciplined, and aristocratic aura. Detailed facial features, cinematic lighting, sharp focus on the armor's metallic textures. Background: A sprawling, muddy Nilfgaardian military camp at dusk, featuring imposing black and gold pavilions, flickering campfires, and silhouettes of soldiers with tall pikes in the distance. Color palette: black, gold, dark grey, crimson accents. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution, trending on ArtStation."
+        "A highly detailed dark fantasy portrait of a character, wearing heavy, ornate black and gold Nilfgaardian plate armor with a prominent sun emblem. The character exudes a stern, disciplined, and aristocratic aura. Detailed facial features, cinematic lighting, sharp focus on the armor's metallic textures. Background: A sprawling, muddy Nilfgaardian military camp at dusk, featuring imposing black and gold pavilions, flickering campfires, and silhouettes of soldiers with tall pikes in the distance. Color palette: black, gold, dark grey, crimson accents."
     ),
     "Monsters": (
         "👾 Чудовища", "Чудовища",
-        "A highly detailed dark fantasy portrait of a terrifying character, mutated with monstrous features, pale veiny skin, wearing grim bone and chitin armor adorned with skulls. The character looks feral and predatory. Eerie, unnatural lighting casting long shadows. Background: A dense, terrifying, foggy swamp at midnight. Twisted, dead ancient trees reaching like claws, glowing yellow eyes hidden in the thick green mist, bubbling toxic water. Color palette: sickly greens, bone white, blood red, abyssal black. Masterpiece, digital oil painting, official Gwent card art style, macabre, 8k resolution."
+        "A highly detailed dark fantasy portrait of a terrifying character, mutated with monstrous features, pale veiny skin, wearing grim bone and chitin armor adorned with skulls. The character looks feral and predatory. Eerie, unnatural lighting casting long shadows. Background: A dense, terrifying, foggy swamp at midnight. Twisted, dead ancient trees reaching like claws, glowing yellow eyes hidden in the thick green mist, bubbling toxic water. Color palette: sickly greens, bone white, blood red, abyssal black."
     ),
     "Skellige": (
         "⚓ Скеллиге", "Скеллиге",
-        "A highly detailed dark fantasy portrait of a rugged viking warrior character, wearing heavy bear-fur mantles, leather padding, and Skellige clan armor with carved celtic knots and runic symbols. Weathered, sea-salt stained textures. Harsh, dramatic, cold lighting. Background: A stormy nordic oceanic coast. Massive crashing waves against jagged steep cliffs, dark storm clouds, heavy rain, and the prow of a wooden viking longship with a dragon head in the turbulent waters. Color palette: cold icy blues, earthy browns, steel grey, sea foam white. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution."
+        "A highly detailed dark fantasy portrait of a rugged viking warrior character, wearing heavy bear-fur mantles, leather padding, and Skellige clan armor with carved celtic knots and runic symbols. Weathered, sea-salt stained textures. Harsh, dramatic, cold lighting. Background: A stormy nordic oceanic coast. Massive crashing waves against jagged steep cliffs, dark storm clouds, heavy rain, and the prow of a wooden viking longship with a dragon head in the turbulent waters. Color palette: cold icy blues, earthy browns, steel grey, sea foam white."
     ),
     "Northern": (
         "⚜️ Королевства Севера", "Королевства Севера",
-        "A highly detailed dark fantasy portrait of a noble medieval character, wearing gleaming, polished steel plate armor draped with blue and silver heraldic tabards. Heroic and stoic pose. Bright, warm, cinematic sunlight highlighting the metallic reflections. Background: A bustling, war-torn courtyard of a besieged massive stone medieval castle. Thick stone walls, wooden trebuchets, flying arrows in the sky, and fluttering blue and silver royal banners. Color palette: royal blue, bright steel, red accents, warm golden sunlight. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution."
+        "A highly detailed dark fantasy portrait of a noble medieval character, wearing gleaming, polished steel plate armor draped with blue and silver heraldic tabards. Heroic and stoic pose. Bright, warm, cinematic sunlight highlighting the metallic reflections. Background: A bustling, war-torn courtyard of a besieged massive stone medieval castle. Thick stone walls, wooden trebuchets, flying arrows in the sky, and fluttering blue and silver royal banners. Color palette: royal blue, bright steel, red accents, warm golden sunlight."
     ),
     "Syndicate": (
         "💰 Синдикат", "Синдикат",
-        "A highly detailed dark fantasy portrait of a cunning and wealthy character, wearing lavish but slightly dirty and frayed medieval merchant clothes, heavy velvet coats, and multiple gold rings on fingers. Shady, conspiratorial look. Warm, glowing lantern light mixed with deep, harsh shadows. Background: A claustrophobic, dirty Novigrad city alleyway at night. Wet cobblestones reflecting the orange glow of wall lanterns, rain puddles, scattered golden coins, and a shadowy figure in the background. Color palette: rich purple, gold, dark murky greens, deep shadows. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution."
+        "A highly detailed dark fantasy portrait of a cunning and wealthy character, wearing lavish but slightly dirty and frayed medieval merchant clothes, heavy velvet coats, and multiple gold rings on fingers. Shady, conspiratorial look. Warm, glowing lantern light mixed with deep, harsh shadows. Background: A claustrophobic, dirty Novigrad city alleyway at night. Wet cobblestones reflecting the orange glow of wall lanterns, rain puddles, scattered golden coins, and a shadowy figure in the background. Color palette: rich purple, gold, dark murky greens, deep shadows."
     ),
     "Scoiatael": (
         "🐿 Скоя'таэли", "Скоя'таэли",
-        "A highly detailed dark fantasy portrait of an elven guerilla character, wearing intricate forest camouflage, green and brown leather armor decorated with leaves and animal fangs. Agile, alert posture. Soft, dappled forest lighting filtering through leaves. Background: A deep, ancient, magical elven forest. Colossal ancient oak trees covered in moss, crumbling white marble elven ruins, blooming glowing flora, and shafts of golden ethereal sunlight piercing the dense canopy. Color palette: lush forest greens, autumn browns, golden light, earthy tones. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution."
+        "A highly detailed dark fantasy portrait of an elven guerilla character, wearing intricate forest camouflage, green and brown leather armor decorated with leaves and animal fangs. Agile, alert posture. Soft, dappled forest lighting filtering through leaves. Background: A deep, ancient, magical elven forest. Colossal ancient oak trees covered in moss, crumbling white marble elven ruins, blooming glowing flora, and shafts of golden ethereal sunlight piercing the dense canopy. Color palette: lush forest greens, autumn browns, golden light, earthy tones."
     ),
     "Neutral": (
         "🐺 Нейтральная", "Нейтральная",
-        "A highly detailed dark fantasy portrait of a hardened, weary character like a witcher or mercenary, wearing well-worn, dark leather studded armor, a silver medallion, and the hilts of twin swords strapped to the back. Gritty, realistic textures. Warm, flickering firelight illuminating the face. Background: A cozy but dimly lit medieval tavern interior. Heavy wooden oak tables, flickering wax candles on skulls, massive ale barrels, and blurry silhouettes of tavern patrons drinking in the background. Color palette: dark leather browns, silver, muted greys, warm orange firelight. Masterpiece, digital oil painting, official Gwent card art style, 8k resolution."
+        "A highly detailed dark fantasy portrait of a hardened, weary character like a witcher or mercenary, wearing well-worn, dark leather studded armor, a silver medallion, and the hilts of twin swords strapped to the back. Gritty, realistic textures. Warm, flickering firelight illuminating the face. Background: A cozy but dimly lit medieval tavern interior. Heavy wooden oak tables, flickering wax candles on skulls, massive ale barrels, and blurry silhouettes of tavern patrons drinking in the background. Color palette: dark leather browns, silver, muted greys, warm orange firelight."
     ),
 }
 
@@ -271,7 +272,7 @@ def card_summary(data: dict) -> str:
         f"⚔️ Сила: {esc(data.get('power', '—'))} | 🛡 Броня: {esc(data.get('armor', '—'))} | "
         f"🍖 Наём: {esc(data.get('provision', '—'))}\n"
         f"🖼 Редкость: {esc(data.get('frame', '—'))}\n"
-        f"✨ Способность: {esc(data.get('ability', '—'))}\n"
+        f"✨ Способность: {esc(strip_markup(data.get('ability', '—')))}\n"
         f"💬 Цитата: <i>{esc(data.get('quote', '—'))}</i>"
     )
     if data.get("edit"):
@@ -323,16 +324,20 @@ bot.setup_middleware(AccessMiddleware())
 # ==========================================
 # 4. ГЕНЕРАЦИЯ ПОЛЕЙ (Gemini / случайные числа)
 # ==========================================
-def ask_gemini(prompt: str) -> Optional[str]:
+def ask_gemini(prompt: str, keep_markup: bool = False, temperature: float = 1.2) -> Optional[str]:
     if gemini_client is None:
         return None
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(temperature=1.2),
+            config=genai_types.GenerateContentConfig(temperature=temperature),
         )
-        text = (response.text or "").strip().strip('"«»').replace("*", "")
+        text = (response.text or "").strip().strip('"«»')
+        if keep_markup:
+            text = text.replace("**", "*")
+        else:
+            text = text.replace("*", "")
         return text or None
     except Exception:
         logger.exception("Ошибка Gemini")
@@ -341,6 +346,7 @@ def ask_gemini(prompt: str) -> Optional[str]:
 
 def text_validator(max_len: int, max_words: Optional[int] = None, min_len: int = 1):
     def validate(value: str) -> Optional[str]:
+        value = strip_markup(value)
         if len(value) < min_len:
             return "⚠️ Маловато! Напиши чуть подробнее, человече."
         if len(value) > max_len:
@@ -369,12 +375,13 @@ class Step:
     ai_prompt: str = ""
     fallbacks: tuple = ()
     random_range: Optional[tuple] = None
+    keep_markup: bool = False
 
 
 def generate_value(step: Step, faction: str) -> str:
     if step.random_range:
         return str(random.randint(*step.random_range))
-    value = ask_gemini(step.ai_prompt.format(faction=faction))
+    value = ask_gemini(step.ai_prompt.format(faction=faction), keep_markup=step.keep_markup)
     if value is None or step.validate(value):
         if value is not None:
             logger.info("Gemini вернул неподходящее значение для %s: %r", step.key, value)
@@ -408,10 +415,23 @@ STEPS = {
         int_validator(4, 99), STATE_FRAME, random_range=(4, 14),
     ),
     STATE_ABILITY: Step(
-        "ability", "✨ Способность", "✨ <b>Что делать умеешь на столе? (Способность)</b>",
+        "ability", "✨ Способность",
+        "✨ <b>Что делать умеешь на столе? (Способность)</b>\n\n"
+        "<i>Пиши как в Гвинте: «Размещение: нанесите 4 урона». Метка с двоеточием и термины вроде "
+        "«яд» или «щит» выделятся сами, а любое слово можно выделить *звёздочками*.</i>",
         text_validator(150), STATE_QUOTE,
-        ai_prompt="Сгенерируй новую способность карты для игры Гвинт (фракция {faction}). Максимум 25 слов. Без кавычек.",
-        fallbacks=("Размещение: нанесите 2 единицы урона.",),
+        ai_prompt=(
+            "Сгенерируй новую способность карты для игры Гвинт (фракция {faction}) в официальном стиле игры. "
+            "Начни с ключевого слова и двоеточия, например «Размещение:», «Приказ:», «Выносливость:» или "
+            "«Месть:». Названия статусов, категорий и карт выдели звёздочками, например *Яд* или *Ведьма*. "
+            "Максимум 25 слов. Без кавычек и пояснений."
+        ),
+        fallbacks=(
+            "Размещение: нанесите 4 единицы урона вражескому отряду.",
+            "Приказ: усильте союзный отряд на 3 единицы.",
+            "Размещение: наложите *Яд* на вражеский отряд.",
+        ),
+        keep_markup=True,
     ),
     STATE_QUOTE: Step(
         "quote", "💬 Цитата", "💬 <b>Умная мысль для самого низа (Цитата)</b>",
@@ -974,7 +994,10 @@ def cb_deck(call):
 
     if action == "card":
         safe_call(bot.answer_callback_query, call.id)
-        caption = card_summary(card["data"]) + f"\n\n📅 {card['created_at'][:10]}"
+        caption = (f"🃏 <b>{esc(strip_markup(card['data'].get('name', '')))}</b> · {esc(card['data'].get('faction', ''))}"
+                   f"\n📅 {card['created_at'][:10]}")
+        if card["data"].get("edit"):
+            caption += f"\n✏️ Правка: {esc(card['data']['edit'])}"
         bot.send_photo(chat_id, card["file_id"], caption=caption, reply_markup=card_markup(card["id"], with_deck=True))
         return
 
@@ -1106,9 +1129,31 @@ def award_referrer(user_id: int):
               f"В мешочке теперь: <b>{balance_text(referrer_id)}</b>")
 
 
+ART_STYLE = (
+    "Official GWENT: The Witcher Card Game card art. Hand-painted digital illustration in the style of "
+    "CD Projekt Red Gwent artists, painterly brushwork with visible brush strokes, textured oil-paint look, "
+    "slightly stylized grim dark fantasy, dramatic chiaroscuro lighting, muted earthy color grading. "
+    "Waist-up portrait of the character, centered, facing the viewer, vertical composition with headroom. "
+)
+ART_NEGATIVE = (
+    "photorealistic, photograph, photo, hyperrealistic, 3d render, cgi, smooth plastic skin, "
+    "text, letters, watermark, card frame, border, ui"
+)
+
+
+def build_art_prompt(data: dict) -> str:
+    role = ask_gemini(
+        "Translate this fantasy character class into English, 1-4 words, reply with the translation only: "
+        + data.get("category", ""),
+        temperature=0.2,
+    )
+    who = f"The character is a {role}. " if role and len(role) <= 60 else ""
+    return ART_STYLE + who + data["faction_prompt"]
+
+
 def run_art_job(chat_id: int, price: int, paid: bool, job: Callable[[int], None]):
     """Общая обвязка: статус, возврат звёзд при ошибке, снятие флага занятости."""
-    status_msg = bot.send_message(chat_id, random.choice(LAVK_WAIT_PHRASES))
+    status_msg = bot.send_message(chat_id, random.choice(LAVK_WAIT_PHRASES), reply_markup=get_main_menu(chat_id))
     try:
         job(status_msg.message_id)
     except FalError as e:
@@ -1125,40 +1170,58 @@ def run_art_job(chat_id: int, price: int, paid: bool, job: Callable[[int], None]
         busy_users.discard(chat_id)
 
 
+def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, parent_id: Optional[int] = None) -> int:
+    """Собирает карту поверх арта, отправляет карту + чистый арт и сохраняет в колоду."""
+    card_image = render_card(art, card_data)
+    caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
+    sent = bot.send_media_group(chat_id, [
+        types.InputMediaPhoto(card_image, caption=caption, parse_mode="HTML"),
+        types.InputMediaPhoto(art),
+    ])
+    card_id = db.add_card(chat_id, card_data, sent[0].photo[-1].file_id,
+                          art_file_id=sent[1].photo[-1].file_id, parent_id=parent_id)
+    bot.send_message(
+        chat_id,
+        "🃏 Картища легла в твою колоду — ищи её в «Моих картищах».\n"
+        "<i>Второй картинкой — чистый арт без рамки, пригодится для аватарки.</i>",
+        reply_markup=card_markup(card_id),
+    )
+    return card_id
+
+
 def generate_card(chat_id: int, data: dict, paid: bool):
     def job(status_id: int):
         image = download_telegram_file(data["photo_id"])
         art = request_fal_image(FAL_GENERATE_ENDPOINT, {
-            "prompt": data["faction_prompt"],
+            "prompt": build_art_prompt(data),
+            "negative_prompt": ART_NEGATIVE,
             "reference_image_url": to_data_uri(image, data["photo_mime"]),
             "image_size": "portrait_4_3",
             "num_inference_steps": 28,
             "guidance_scale": 4.0,
             "true_cfg": 1.0,
-            "id_weight": 0.85,
+            "id_weight": 0.8,
         })
         card_data = {k: v for k, v in data.items() if k not in ("photo_id", "photo_mime", "faction_prompt")}
         safe_call(bot.delete_message, chat_id, status_id)
-        sent = bot.send_photo(chat_id, art, caption="🔥 <b>ТВОЯ ИСТИННАЯ КАРТИЩА ГОТОВА!</b>\n\n" + card_summary(card_data))
-        card_id = db.add_card(chat_id, card_data, sent.photo[-1].file_id)
-        safe_call(bot.edit_message_reply_markup, chat_id, sent.message_id, reply_markup=card_markup(card_id))
+        deliver_card(chat_id, art, card_data, "🔥 <b>ТВОЯ ИСТИННАЯ КАРТИЩА ГОТОВА!</b>")
         if paid:
             award_referrer(chat_id)
-        bot.send_message(chat_id, "🃏 Картища легла в твою колоду — ищи её в «Моих картищах».",
-                         reply_markup=get_main_menu(chat_id))
 
     run_art_job(chat_id, GENERATION_PRICE, paid, job)
 
 
 def edit_card(chat_id: int, card: dict, instruction: str, paid: bool):
     def job(status_id: int):
-        image = download_telegram_file(card["file_id"])
+        # У карт, созданных до появления рамки, file_id — это сам арт.
+        image = download_telegram_file(card.get("art_file_id") or card["file_id"])
         english = ask_gemini(
             "Translate this image edit request into one short English instruction for an image editing model. "
-            "Reply with the instruction only.\n\n" + instruction
+            "Reply with the instruction only.\n\n" + instruction,
+            temperature=0.2,
         ) or instruction
         art = request_fal_image(FAL_EDIT_ENDPOINT, {
-            "prompt": f"{english}. Keep the person's face, identity and the dark fantasy Gwent card art style unchanged.",
+            "prompt": f"{english}. Keep the person's face, identity and the hand-painted Gwent card art style unchanged.",
             "image_url": to_data_uri(image, "image/jpeg"),
             "aspect_ratio": "3:4",
             "guidance_scale": 3.5,
@@ -1166,10 +1229,7 @@ def edit_card(chat_id: int, card: dict, instruction: str, paid: bool):
         })
         card_data = dict(card["data"], edit=instruction)
         safe_call(bot.delete_message, chat_id, status_id)
-        sent = bot.send_photo(chat_id, art, caption="✏️ <b>ПРАВКА ГОТОВА!</b>\n\n" + card_summary(card_data))
-        new_id = db.add_card(chat_id, card_data, sent.photo[-1].file_id, parent_id=card["id"])
-        safe_call(bot.edit_message_reply_markup, chat_id, sent.message_id, reply_markup=card_markup(new_id))
-        bot.send_message(chat_id, "🃏 Исправленная картища тоже легла в колоду.", reply_markup=get_main_menu(chat_id))
+        deliver_card(chat_id, art, card_data, "✏️ <b>ПРАВКА ГОТОВА!</b>", parent_id=card["id"])
 
     run_art_job(chat_id, EDIT_PRICE, paid, job)
 

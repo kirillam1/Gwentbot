@@ -1,3 +1,4 @@
 pyTelegramBotAPI>=4.20
 google-genai>=1.0
 requests>=2.31
+Pillow>=10.1

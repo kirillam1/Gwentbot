@@ -58,6 +58,10 @@ class Database:
         self.lock = threading.Lock()
         with self.lock, self.conn:
             self.conn.executescript(SCHEMA)
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(cards)")}
+            if "art_file_id" not in columns:
+                # Чистый арт без рамки — исходник для правок.
+                self.conn.execute("ALTER TABLE cards ADD COLUMN art_file_id TEXT")
 
     def _one(self, sql: str, params=()):
         with self.lock:
@@ -152,11 +156,12 @@ class Database:
             return True
 
     # ---------- картищи ----------
-    def add_card(self, user_id: int, data: dict, file_id: str, parent_id: Optional[int] = None) -> int:
+    def add_card(self, user_id: int, data: dict, file_id: str, art_file_id: Optional[str] = None,
+                 parent_id: Optional[int] = None) -> int:
         with self.lock, self.conn:
             cur = self.conn.execute(
-                "INSERT INTO cards (user_id, parent_id, data, file_id, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, parent_id, json.dumps(data, ensure_ascii=False), file_id, now()),
+                "INSERT INTO cards (user_id, parent_id, data, file_id, art_file_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, parent_id, json.dumps(data, ensure_ascii=False), file_id, art_file_id, now()),
             )
             return cur.lastrowid
 
