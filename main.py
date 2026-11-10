@@ -33,7 +33,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 FAL_KEY = os.getenv("FAL_API_KEY")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
-DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "lavk.db"))
+# На Amvera постоянное хранилище — /data: база там переживает пересборки.
+DB_PATH = os.getenv("DB_PATH") or os.path.join("/data" if os.path.isdir("/data") else BASE_DIR, "lavk.db")
 
 CHANNEL_ID = "@Master_Lavk"
 SUPPORT_CONTACT = "@S159YKRF4"
@@ -419,7 +420,7 @@ STEPS = {
         "✨ <b>Что делать умеешь на столе? (Способность)</b>\n\n"
         "<i>Пиши как в Гвинте: «Размещение: нанесите 4 урона». Метка с двоеточием и термины вроде "
         "«яд» или «щит» выделятся сами, а любое слово можно выделить *звёздочками*.</i>",
-        text_validator(150), STATE_QUOTE,
+        text_validator(300), STATE_QUOTE,
         ai_prompt=(
             "Сгенерируй новую способность карты для игры Гвинт (фракция {faction}) в официальном стиле игры. "
             "Начни с ключевого слова и двоеточия, например «Размещение:», «Приказ:», «Выносливость:» или "
