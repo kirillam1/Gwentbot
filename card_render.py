@@ -7,15 +7,16 @@
 import io
 import os
 import re
+import zipfile
 from functools import lru_cache
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FONT_DIR = os.path.join(BASE_DIR, "assets", "fonts")
-CARD_DIR = os.path.join(BASE_DIR, "assets", "card")
-SPRITE_DIR = os.path.join(CARD_DIR, "sprites")
+ASSET_DIR = os.path.join(BASE_DIR, "assets")
+# Хостинги без загрузки папок (Amvera через браузер): те же файлы можно положить одним assets.zip рядом с кодом.
+ASSET_ZIP = os.path.join(BASE_DIR, "assets.zip")
 
 FONT_NAME = "GWENT-ExtraBold.ttf"
 FONT_NUMBER = "gnum.ttf"
@@ -84,14 +85,35 @@ NORMAL, KEYWORD = "normal", "keyword"
 
 @lru_cache(maxsize=64)
 def font(name: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    return ImageFont.truetype(io.BytesIO(asset_bytes(f"fonts/{name}")), size)
+
+
+@lru_cache(maxsize=128)
+def asset_bytes(rel: str) -> bytes:
+    """Файл из папки assets, а если её нет — из assets.zip (пути внутри архива те же)."""
+    path = os.path.join(ASSET_DIR, rel)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    with zipfile.ZipFile(ASSET_ZIP) as zf:
+        return zf.read(rel)
+
+
+def asset_exists(rel: str) -> bool:
+    if os.path.exists(os.path.join(ASSET_DIR, rel)):
+        return True
+    if not os.path.exists(ASSET_ZIP):
+        return False
+    with zipfile.ZipFile(ASSET_ZIP) as zf:
+        return rel in zf.namelist()
 
 
 @lru_cache(maxsize=64)
 def asset(name: str) -> Image.Image:
-    path = os.path.join(SPRITE_DIR if name.endswith(".png") and os.path.exists(os.path.join(SPRITE_DIR, name))
-                        else CARD_DIR, name)
-    return Image.open(path).convert("RGBA")
+    rel = f"card/sprites/{name}"
+    if not asset_exists(rel):
+        rel = f"card/{name}"
+    return Image.open(io.BytesIO(asset_bytes(rel))).convert("RGBA")
 
 
 def strip_markup(text: str) -> str:
