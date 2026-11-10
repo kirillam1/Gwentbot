@@ -1844,15 +1844,76 @@ def status_ticker(chat_id: int, status, stop: threading.Event):
         edit_screen(chat_id, status, phrase + WAIT_INTRO)
 
 
+# ---------- очередь генераций ----------
+# Одновременно у Fal рисуется не больше GEN_SLOTS картищ, остальные ждут своей очереди.
+# Ожидание в очереди не съедает дедлайн генерации, и сервер не захлёбывается при наплыве.
+GEN_SLOTS = max(1, int(os.getenv("GEN_SLOTS", "4")))
+_gen_queue: list[int] = []
+_gen_active = 0
+_gen_cv = threading.Condition()
+# Сборка карты — ~0,25 с и ~60 МБ памяти; по одной, чтобы при наплыве не упереться в память.
+RENDER_LOCK = threading.Lock()
+
+
+def queue_text(place: int) -> str:
+    minutes = max(1, round(place * 1.5 / GEN_SLOTS + 1))
+    return (f"⏳ <b>У Лавка очередь из желающих!</b>\n\nТы в очереди: <b>{place}-й</b>. "
+            f"Примерно через {minutes} мин. Лавк возьмётся за твою картищу.\n"
+            "<i>Можно закрыть чат — карта придёт сама, место не пропадёт.</i>")
+
+
+def wait_for_slot(chat_id: int, status) -> bool:
+    """Ждёт свободного художника. True — пришлось постоять в очереди."""
+    global _gen_active
+    shown, queued = None, False
+    with _gen_cv:
+        _gen_queue.append(chat_id)
+    try:
+        while True:
+            with _gen_cv:
+                if _gen_active < GEN_SLOTS and _gen_queue[0] == chat_id:
+                    _gen_queue.pop(0)
+                    _gen_active += 1
+                    return queued
+                place = _gen_queue.index(chat_id) + 1
+                if place == shown:
+                    _gen_cv.wait(timeout=10)
+                    continue
+            # Сообщение правим вне блокировки, чтобы не задерживать очередь сетевым запросом.
+            shown, queued = place, True
+            edit_screen(chat_id, status, queue_text(place))
+    except BaseException:
+        with _gen_cv:
+            if chat_id in _gen_queue:
+                _gen_queue.remove(chat_id)
+            _gen_cv.notify_all()
+        raise
+
+
+def release_slot():
+    global _gen_active
+    with _gen_cv:
+        _gen_active -= 1
+        _gen_cv.notify_all()
+
+
 def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[object], None]):
-    """Общая обвязка: статус, возврат звёзд при ошибке, снятие флага занятости.
+    """Общая обвязка: очередь, статус, возврат звёзд при ошибке, снятие флага занятости.
 
     mode: paid — списаны звёзды, free — безлимит/админ, trial — пробная картища.
     """
     stop = threading.Event()
     status = None
+    slot = False
     try:
-        status = send_screen(chat_id, "wait", random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO)
+        with _gen_cv:
+            busy = _gen_active >= GEN_SLOTS or bool(_gen_queue)
+            place = len(_gen_queue) + 1
+        first = queue_text(place) if busy else random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO
+        status = send_screen(chat_id, "wait", first)
+        if wait_for_slot(chat_id, status):
+            edit_screen(chat_id, status, "🎨 <b>Твоя очередь!</b> " + random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO)
+        slot = True
         threading.Thread(target=status_ticker, args=(chat_id, status, stop), daemon=True).start()
         job(status)
     except Exception as e:
@@ -1870,6 +1931,8 @@ def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[object], Non
                   reply_markup=get_main_menu(chat_id))
     finally:
         stop.set()
+        if slot:
+            release_slot()
         busy_users.discard(chat_id)
 
 
@@ -1899,7 +1962,8 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                  parent_id: Optional[int] = None) -> int:
     """Собирает карту поверх арта, отправляет полную карту + карту в рамке и сохраняет в колоду."""
     trial = bool(card_data.get("trial"))
-    full, card_only = render_card(art, card_data, trial=trial)
+    with RENDER_LOCK:
+        full, card_only = render_card(art, card_data, trial=trial)
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
     sent = tg_retry(bot.send_media_group, chat_id, [
         types.InputMediaPhoto(full, caption=caption, parse_mode="HTML"),
@@ -2191,7 +2255,7 @@ def cb_admin(call):
             f"🚫 Заблокировано: {s['blocked']} · ♾ Безлимит: {s['unlimited']}\n"
             f"🃏 Картищ: <b>{s['cards']}</b> (сегодня +{s['cards_today']})\n"
             f"⭐ Пополнено звёзд: <b>{s['stars']}</b> (сегодня +{s['stars_today']})\n"
-            f"⏳ Рисуется сейчас: {len(busy_users)}",
+            f"⏳ Рисуется сейчас: {_gen_active} из {GEN_SLOTS} · в очереди: {len(_gen_queue)}",
         )
     elif action == "find":
         user_states[chat_id] = STATE_ADMIN_FIND
