@@ -390,18 +390,19 @@ ATTIRE = {
     ),
 }
 
-# Позы без кистей рук в кадре: FLUX часто ошибается с пальцами, а у бюста руки уходят за нижний край.
 ART_POSES = (
-    "body turned three-quarters, looking straight at the viewer",
+    "standing in a three-quarter view, one hand resting on the pommel of a sheathed sword",
+    "raising a weapon in a battle-ready stance",
+    "arms crossed over the chest, looking down at the viewer with confidence",
     "glancing over the shoulder with a wary look",
-    "head slightly raised, looking down at the viewer with confidence",
-    "looking into the distance with a cloak billowing in the wind",
-    "facing the viewer squarely with a stern, intense gaze",
-    "head tilted with a sly half-smile",
-    "the hilt of a sword visible over the shoulder, looking at the viewer",
-    "a hood half pulled back, eyes narrowed",
-    "turning toward the viewer as if just called by name",
-    "a long weapon resting against the shoulder, its grip below the frame",
+    "holding a flickering torch that lights the face from below",
+    "gripping a weapon with both hands, leaning slightly forward",
+    "with a cloak billowing in the wind, looking into the distance",
+    "pointing forward as if commanding troops into battle",
+    "kneeling on one knee, leaning on a planted sword",
+    "walking toward the viewer through smoke and embers",
+    "drawing a blade from its scabbard",
+    "seated on a rough wooden throne, chin resting on a fist",
 )
 ART_MOODS = (
     "at dusk under a dramatic orange sky", "in heavy rain", "in drifting snowfall", "in thick rolling fog",
@@ -1867,14 +1868,18 @@ ART_STYLE = (
     "Slavic medieval folklore atmosphere, epic cinematic composition like a Witcher 3 key art. "
 )
 ART_SCENE = (
-    "Chest-up bust portrait framed from mid-chest upward, the hands and lower arms below the bottom edge of the frame. "
-    "The character fills the lower two thirds, face clearly visible and lit, room above the head. "
+    "Waist-up portrait, the character in the lower two thirds, face clearly visible and lit, room above the head. "
+    # FLUX лучше слушается конкретного описания рук, чем общего «no extra fingers».
+    "Anatomically correct hands: each hand has exactly five fingers — one thumb and four fingers — with natural "
+    "knuckles and proportions; hands are relaxed or firmly gripping, partly in shadow or gloved where it suits the outfit. "
     "A fully painted richly detailed environment behind the character fills the whole image with depth, "
     "foreground and background elements, atmospheric perspective, no plain or empty backdrop. "
     # Отрицательный промпт при true_cfg=1 моделью игнорируется, поэтому запреты — прямо в описании.
     "Not anime, not manga, not cartoon, not cel-shaded, no glossy airbrushed skin, no big shiny eyes."
 )
 ART_NEGATIVE = (
+    "extra fingers, six fingers, missing fingers, fused fingers, mutated hands, deformed hands, extra hands, "
+    "extra arms, malformed limbs, "
     "anime, manga, cartoon, cel shading, chibi, big eyes, doll face, glossy airbrushed skin, "
     "photograph, 3d render, cgi, modern clothing, "
     "plain background, studio backdrop, white background, empty background, gradient background, "
