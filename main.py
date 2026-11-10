@@ -40,8 +40,10 @@ CHANNEL_ID = "@Master_Lavk"
 SUPPORT_CONTACT = "@S159YKRF4"
 WELCOME_IMAGE = os.path.join(BASE_DIR, "1794190872103.jpg")
 
-FAL_GENERATE_ENDPOINT = "https://fal.run/fal-ai/flux-pulid"
-FAL_EDIT_ENDPOINT = "https://fal.run/fal-ai/flux-pro/kontext"
+FAL_GENERATE_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pulid"
+FAL_EDIT_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/kontext"
+FAL_DEADLINE = 240        # секунд на всю генерацию, потом отмена и возврат звёзд
+GEMINI_TIMEOUT_MS = 30_000
 
 GENERATION_PRICE = 120
 EDIT_PRICE = 60
@@ -59,7 +61,9 @@ apihelper.READ_TIMEOUT = 90
 apihelper.CONNECT_TIMEOUT = 90
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", use_class_middlewares=True)
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Без таймаута запрос к Gemini может висеть бесконечно и подвесить генерацию карты.
+gemini_client = (genai.Client(api_key=GEMINI_API_KEY, http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+                 if GEMINI_API_KEY else None)
 db = Database(DB_PATH)
 
 # Состояние диалога живёт в памяти: после перезапуска незавершённый ввод просто начинается заново.
@@ -1091,17 +1095,38 @@ def to_data_uri(image_bytes: bytes, mime: str) -> str:
 
 
 def request_fal_image(endpoint: str, payload: dict) -> bytes:
+    """Генерация через очередь Fal: запрос не висит на одном соединении, есть общий дедлайн."""
     if not FAL_KEY:
         raise FalError("не задан FAL_API_KEY")
     headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
-    response = requests.post(endpoint, json=payload, headers=headers, timeout=180)
+    response = requests.post(endpoint, json=payload, headers=headers, timeout=60)
     if not response.ok:
         logger.error("Fal.ai %s: %s", response.status_code, response.text[:1000])
         raise FalError(f"Fal.ai вернул код {response.status_code}")
+    job = response.json()
+    deadline = time.monotonic() + FAL_DEADLINE
+    while True:
+        if time.monotonic() > deadline:
+            logger.error("Fal.ai: истёк дедлайн для %s", job.get("request_id"))
+            try:
+                requests.put(job["cancel_url"], headers=headers, timeout=15)
+            except Exception:
+                logger.exception("Fal.ai: не удалось отменить запрос")
+            raise FalError("художник слишком долго не отвечал")
+        time.sleep(2)
+        try:
+            status = requests.get(job["status_url"], headers=headers, timeout=30).json().get("status")
+        except (requests.RequestException, ValueError):
+            logger.warning("Fal.ai: не удалось получить статус, повторю")
+            continue
+        if status == "COMPLETED":
+            break
+    result = requests.get(job["response_url"], headers=headers, timeout=60)
     try:
-        image_url = response.json()["images"][0]["url"]
-    except (ValueError, KeyError, IndexError, TypeError):
-        logger.error("Неожиданный ответ Fal.ai: %s", response.text[:1000])
+        result.raise_for_status()
+        image_url = result.json()["images"][0]["url"]
+    except (requests.HTTPError, ValueError, KeyError, IndexError, TypeError):
+        logger.error("Неожиданный ответ Fal.ai: %s %s", result.status_code, result.text[:1000])
         raise FalError("Fal.ai вернул ответ без картинки")
     art = requests.get(image_url, timeout=90)
     art.raise_for_status()
