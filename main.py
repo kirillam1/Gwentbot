@@ -48,6 +48,7 @@ WELCOME_IMAGE = os.path.join(BASE_DIR, "1794190872103.jpg")
 FAL_GENERATE_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pulid"
 FAL_EDIT_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/kontext"
 FAL_MASK_ENDPOINT = "https://queue.fal.run/fal-ai/birefnet/v2"
+FAL_FILL_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/v1/fill"
 FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
 GEMINI_TIMEOUT_MS = 30_000
 
@@ -389,19 +390,18 @@ ATTIRE = {
     ),
 }
 
+# Позы без кистей рук в кадре: FLUX часто ошибается с пальцами, а у бюста руки уходят за нижний край.
 ART_POSES = (
-    "standing in a three-quarter view, one hand resting on the pommel of a sheathed sword",
-    "raising a weapon in a battle-ready stance",
-    "arms crossed over the chest, looking down at the viewer with confidence",
+    "body turned three-quarters, looking straight at the viewer",
     "glancing over the shoulder with a wary look",
-    "holding a flickering torch that lights the face from below",
-    "gripping a weapon with both hands, leaning slightly forward",
-    "with a cloak billowing in the wind, looking into the distance",
-    "pointing forward as if commanding troops into battle",
-    "kneeling on one knee, leaning on a planted sword",
-    "walking toward the viewer through smoke and embers",
-    "drawing a blade from its scabbard",
-    "seated on a rough wooden throne, chin resting on a fist",
+    "head slightly raised, looking down at the viewer with confidence",
+    "looking into the distance with a cloak billowing in the wind",
+    "facing the viewer squarely with a stern, intense gaze",
+    "head tilted with a sly half-smile",
+    "the hilt of a sword visible over the shoulder, looking at the viewer",
+    "a hood half pulled back, eyes narrowed",
+    "turning toward the viewer as if just called by name",
+    "a long weapon resting against the shoulder, its grip below the frame",
 )
 ART_MOODS = (
     "at dusk under a dramatic orange sky", "in heavy rain", "in drifting snowfall", "in thick rolling fog",
@@ -1867,7 +1867,8 @@ ART_STYLE = (
     "Slavic medieval folklore atmosphere, epic cinematic composition like a Witcher 3 key art. "
 )
 ART_SCENE = (
-    "Waist-up portrait, the character in the lower two thirds, face clearly visible and lit, room above the head. "
+    "Chest-up bust portrait framed from mid-chest upward, the hands and lower arms below the bottom edge of the frame. "
+    "The character fills the lower two thirds, face clearly visible and lit, room above the head. "
     "A fully painted richly detailed environment behind the character fills the whole image with depth, "
     "foreground and background elements, atmospheric perspective, no plain or empty backdrop. "
     # Отрицательный промпт при true_cfg=1 моделью игнорируется, поэтому запреты — прямо в описании.
@@ -2110,9 +2111,9 @@ def generate_card(chat_id: int, data: dict, mode: str):
             "negative_prompt": ART_NEGATIVE,
             "reference_image_url": reference,
             "image_size": "portrait_4_3",
-            "num_inference_steps": 28,
-            # Ниже guidance — меньше «глянца», мазки живее.
-            "guidance_scale": 3.5,
+            "num_inference_steps": 30,
+            # 4.0 — компромисс: ниже даёт живее мазки, но портит анатомию.
+            "guidance_scale": 4.0,
             "true_cfg": 1.0,
             "id_weight": 0.8,
             # Лицо подмешивается позже — у модели больше свободы на рисованный стиль (ценой части сходства).
@@ -2158,6 +2159,8 @@ BG_WORDS = ("фон", "задн", "небо", "ночь", "ночн", "днём"
             "лес", "горы", "море", "замок", "город", "дождь", "снег", "туман", "пещер", "таверн")
 KEEP_IDENTITY = ("Keep the exact same person: identical facial features, face shape, eyes, nose, mouth, skin tone, "
                  "hairstyle and expression. Keep the same position, scale, pose and camera framing.")
+# Добавляется только к правкам, которые могут затронуть руки (оружие, предметы, позы).
+HANDS_OK = "Any visible hands are anatomically correct, with five fingers each."
 EDIT_STYLE = "Hand-painted GWENT card art style, painterly brush strokes."
 
 
@@ -2194,7 +2197,7 @@ def subject_mask(image_uri: str) -> bytes:
 
 
 def composite_subject(source: bytes, background: bytes, mask: bytes) -> bytes:
-    """Кладёт исходного героя (пиксель в пиксель) на новый фон, слегка подстраивая общий тон под сцену."""
+    """Кладёт исходного героя (пиксель в пиксель) на новый фон, чуть подстраивая общий тон под сцену."""
     src = Image.open(io.BytesIO(source)).convert("RGB")
     bg = Image.open(io.BytesIO(background)).convert("RGB").resize(src.size, Image.LANCZOS)
     m = Image.open(io.BytesIO(mask)).convert("L").resize(src.size, Image.LANCZOS)
@@ -2205,38 +2208,48 @@ def composite_subject(source: bytes, background: bytes, mask: bytes) -> bytes:
     weight = max(float(outside.sum()), 1.0)
     old_tone = (a * outside).sum(axis=(0, 1)) / weight
     new_tone = (b * outside).sum(axis=(0, 1)) / weight
-    # Половина разницы освещения: герой «садится» в сцену, но лицо не меняется.
-    gain = np.clip(new_tone / np.maximum(old_tone, 1), 0.6, 1.4) ** 0.5
+    # Фон уже дорисован под героя, поэтому тон подстраиваем лишь слегка.
+    gain = np.clip(new_tone / np.maximum(old_tone, 1), 0.7, 1.3) ** 0.3
     out = np.clip(a * gain, 0, 255) * alpha + b * outside
     buf = io.BytesIO()
     Image.fromarray(out.astype(np.uint8)).save(buf, "JPEG", quality=93)
     return buf.getvalue()
 
 
+def fill_mask_png(mask: bytes, size: tuple[int, int]) -> bytes:
+    """Маска для FLUX Fill: белое — перерисовать (всё, кроме героя). Край заходит на героя на пару пикселей,
+    чтобы вместе со старым фоном ушёл и его ореол вокруг волос и плеч."""
+    m = Image.open(io.BytesIO(mask)).convert("L").resize(size, Image.LANCZOS)
+    fill = m.point(lambda v: 255 if v < 128 else 0).filter(ImageFilter.MaxFilter(5))
+    buf = io.BytesIO()
+    fill.save(buf, "PNG")
+    return buf.getvalue()
+
+
 def replace_background(source: bytes, scene: str) -> bytes:
+    """Новый фон дорисовывается вокруг героя (FLUX Fill), сам герой не перерисовывается.
+
+    Раньше сцена рисовалась отдельно и фигура вклеивалась поверх — получалось, что поясной портрет
+    «висит в воздухе». Fill видит героя и строит землю, перспективу и свет под него.
+    """
     uri = to_data_uri(source, "image/jpeg")
-    results: dict = {}
-
-    def mask_job():
-        try:
-            results["mask"] = subject_mask(uri)
-        except Exception as e:
-            results["mask_error"] = e
-
-    worker = threading.Thread(target=mask_job, daemon=True)
-    worker.start()
-    # Kontext рисует сцену без героя — тогда под вклеенной фигурой не остаётся «призрака» старого силуэта.
-    empty = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
-        "prompt": (f"Remove the character completely, leaving only the scene, and change the scene to: {scene} "
-                   f"Keep the same camera angle, perspective and composition. {EDIT_STYLE}"),
-        "image_url": uri, "aspect_ratio": "3:4", "guidance_scale": 3.5, "output_format": "jpeg",
-    })
-    worker.join(timeout=FAL_DEADLINE)
-    if "mask" not in results:
+    try:
+        mask = subject_mask(uri)
+    except FalError as e:
         # Без маски — запасной путь: обычная правка фона с защитой лица.
-        logger.warning("Маска героя не получена (%r), правлю фон напрямую", results.get("mask_error"))
+        logger.warning("Маска героя не получена (%s), правлю фон напрямую", e)
         return edit_with_identity(source, f"Change the background to: {scene}", restore=True)
-    return composite_subject(source, empty, results["mask"])
+    size = Image.open(io.BytesIO(source)).size
+    mask_uri = to_data_uri(fill_mask_png(mask, size), "image/png")
+    filled = fal_with_retry(FAL_FILL_ENDPOINT, lambda: {
+        "prompt": (f"A dark fantasy portrait of a character in front of {scene} The scene continues naturally behind "
+                   f"and around the character, with matching perspective, scale and lighting. {EDIT_STYLE}"),
+        "image_url": uri,
+        "mask_url": mask_uri,
+        "output_format": "jpeg",
+        "seed": random.randint(1, 2 ** 31 - 1),
+    })
+    return composite_subject(source, filled, mask)
 
 
 def face_box(image: bytes) -> Optional[tuple[int, int, int, int]]:
@@ -2282,7 +2295,7 @@ def edit_with_identity(source: bytes, instruction: str, restore: bool) -> bytes:
     uri = to_data_uri(source, "image/jpeg")
     keep = KEEP_IDENTITY if restore else "Keep everything else, the person's identity and the pose the same."
     edited = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
-        "prompt": f"{instruction} {keep} {EDIT_STYLE}",
+        "prompt": f"{instruction} {keep} {HANDS_OK} {EDIT_STYLE}",
         "image_url": uri, "aspect_ratio": "3:4", "guidance_scale": 3.5, "output_format": "jpeg",
     })
     return restore_face(source, edited) if restore else edited
