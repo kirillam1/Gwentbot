@@ -1,5 +1,6 @@
 import base64
 import html
+import io
 import logging
 import os
 import random
@@ -13,6 +14,7 @@ from urllib.parse import quote
 
 import requests
 import telebot
+from PIL import Image
 from google import genai
 from google.genai import types as genai_types
 from telebot import apihelper, types
@@ -43,12 +45,12 @@ WELCOME_IMAGE = os.path.join(BASE_DIR, "1794190872103.jpg")
 
 FAL_GENERATE_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pulid"
 FAL_EDIT_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/kontext"
-FAL_DEADLINE = 240        # секунд на всю генерацию, потом отмена и возврат звёзд
+FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
 GEMINI_TIMEOUT_MS = 30_000
 
 GENERATION_PRICE = 100
 EDIT_PRICE = 50
-REFERRAL_BONUS = 60
+REFERRAL_BONUS = 50
 # (сколько платит, сколько звёзд падает в мешочек) — чем больше набор, тем выгоднее
 TOPUP_PACKS = ((100, 100), (190, 200), (270, 300), (700, 1000))
 TOPUP_MIN, TOPUP_MAX = 1, 10000
@@ -63,7 +65,18 @@ if not ADMIN_IDS:
 apihelper.READ_TIMEOUT = 90
 apihelper.CONNECT_TIMEOUT = 90
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", use_class_middlewares=True)
+class LogExceptions(telebot.ExceptionHandler):
+    """Ошибка в одном обработчике не должна перезапускать опрос Telegram для всех."""
+
+    def handle(self, exception):
+        logger.error("Ошибка в обработчике: %r", exception, exc_info=exception)
+        return True
+
+
+# По умолчанию у telebot 2 потока: одна медленная операция (загрузка фото, проверка подписки)
+# тормозила ответы всем остальным пользователям.
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", use_class_middlewares=True, num_threads=8,
+                      exception_handler=LogExceptions())
 # Без таймаута запрос к Gemini может висеть бесконечно и подвесить генерацию карты.
 gemini_client = (genai.Client(api_key=GEMINI_API_KEY, http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
                  if GEMINI_API_KEY else None)
@@ -80,8 +93,8 @@ busy_users: set[int] = set()
     STATE_FRAME, STATE_ABILITY, STATE_QUOTE, STATE_CONFIRM, STATE_SPIRITS,
     STATE_EDIT_PROMPT, STATE_EDIT_CONFIRM, STATE_TOPUP_AMOUNT,
     STATE_ADMIN_FIND, STATE_ADMIN_BALANCE, STATE_ADMIN_BROADCAST, STATE_ADMIN_BROADCAST_CONFIRM,
-    STATE_PROMO, STATE_ADMIN_PROMO,
-) = range(22)
+    STATE_PROMO, STATE_ADMIN_PROMO, STATE_ADMIN_SCENE,
+) = range(23)
 
 @dataclass(frozen=True)
 class Faction:
@@ -92,7 +105,10 @@ class Faction:
     backgrounds: tuple       # фоны в духе фракции, выбираются случайно
     palette: str
     mechanics: str           # ключевые слова способностей этой фракции (для Gemini)
-    name_hint: str
+    names: tuple             # примеры имён: подсказка духам и запасной вариант
+    categories: tuple
+    quote_theme: str
+    quotes: tuple
     fallbacks: tuple         # запасные способности, если Gemini не ответил
 
 
@@ -100,16 +116,27 @@ FACTIONS = {
     "Nilfgaard": Faction(
         "🛡 Нильфгаард", "Нильфгаард",
         "Империя Белого Пламени: железная дисциплина, шпионы и придворные интриги. Чёрное с золотом.",
-        "wearing ornate black enamelled Nilfgaardian plate armor with gold trim and a golden sun emblem on the chest, "
-        "a black cloak, stern disciplined aristocratic look",
+        "wearing ornate black enamelled Nilfgaardian plate armor with gold filigree and a golden sun emblem on the chest, "
+        "a heavy black cloak with a high collar, stern disciplined aristocratic look",
         (
-            "a vast Nilfgaardian war camp at dusk, black and gold pavilions, campfires, rows of pikemen and imperial sun banners",
+            "a vast Nilfgaardian war camp, black and gold pavilions, campfires, rows of pikemen and imperial sun banners",
             "the marble throne hall of the imperial palace in the City of Golden Towers, golden sun mosaics, tall columns and braziers",
-            "a burning Northern village behind advancing Nilfgaardian ranks, black banners with a golden sun, smoke and embers in the sky",
+            "a burning Northern village behind advancing Nilfgaardian ranks, black banners with a golden sun, smoke and embers",
+            "a shadowy imperial intelligence office, maps and sealed letters on a desk, a single candle, an agent in the doorway",
+            "the scorching desert road of Vicovaro, an imperial legion marching past ancient sandstone ruins",
+            "the deck of an imperial warship at sea, black sails with a golden sun, a burning coastal fort on the horizon",
         ),
         "Color palette: black, gold, dark steel, crimson accents.",
         "Размещение, Приказ, Шпионаж, Блокировка, Раскрытие, Ассимиляция, Захват, Порядок, Уязвимость, Яд",
-        "имперское имя на нильфгаардский лад (например «Кагыр Маур Дыффин», «Мэнно Коэгоорн», «Риенс ван Эмрейс»)",
+        ("Кагыр Маур Дыффин", "Мэнно Коэгоорн", "Ардал аэп Даги", "Вилгефорц Ван Эмрейс", "Стефан Скеллен",
+         "Мориц Рейвенхарт", "Деррик аэп Варрен", "Тибор Эггебрахт", "Эльан Вар Геллер", "Аурелия Мэйр",
+         "Гвидо Тиль аэп Сельверт", "Леонарда Ван Даален", "Фаусто Дейн", "Сарвий Бреннард", "Эррил Фаррах"),
+        ("Человек, Солдат", "Человек, Офицер", "Человек, Агент", "Человек, Аристократ", "Человек, Маг",
+         "Человек, Рыцарь", "Человек, Шпион", "Человек, Инженер"),
+        "о порядке, долге перед Императором, дисциплине и неизбежности победы Нильфгаарда",
+        ("Империя не прощает. Империя помнит.", "Приказ есть приказ. Всё остальное — мнение.",
+         "Белое Пламя пляшет на курганах врагов.", "Мы не завоёвываем. Мы наводим порядок.",
+         "Север падёт — не сегодня, так завтра.", "Каждый шпион служит Империи. Иногда — сам того не зная."),
         (
             "Размещение: наложите *Блокировку* на вражеский отряд и нанесите ему 3 ед. урона.",
             "Приказ: раскройте случайную карту в руке противника.",
@@ -119,16 +146,27 @@ FACTIONS = {
     "Monsters": Faction(
         "👾 Чудовища", "Чудовища",
         "Твари из болот, пещер и туманов: голод, когти, древние проклятия и Дикая Охота.",
-        "a terrifying monstrous being with pale veined skin, feral eyes and bestial features, wearing grim armor of bone, "
-        "chitin and rotten leather adorned with skulls and claws",
+        "a terrifying monstrous being with pale veined skin, feral glowing eyes and bestial features, wearing grim armor "
+        "of bone, chitin and rotten leather adorned with skulls and claws",
         (
             "a foggy swamp at midnight, twisted dead trees like claws, glowing eyes hidden in green mist, bubbling black water",
             "a dark cave lair littered with bones and gnawed armor, dripping stalactites, a faint sickly green glow",
             "a frozen battlefield under a blood-red moon, spectral riders of the Wild Hunt in the storm clouds, crows over the dead",
+            "an overgrown cursed cemetery with crooked gravestones, ghostly blue wisps and a broken crypt",
+            "a ruined elven aqueduct turned into an insect hive, sticky webs, cocoons and eerie amber light",
+            "a burning mountain peak with a dragon's hoard of gold and charred bones, smoke and ash in the air",
         ),
         "Color palette: sickly greens, bone white, blood red, abyssal black.",
         "Размещение, Приказ, Завещание, Поглощение, Рост, Доминирование, Кровотечение, Яд, Уязвимость",
-        "жуткое имя чудовища или прозвище (например «Кельтуллис», «Старая Сводница», «Имлерих»)",
+        ("Кельтуллис", "Старая Сводница", "Имлерих", "Гнилоклык", "Шептунья с Топей", "Костолом",
+         "Мать Туманов", "Вечноголодный Гарг", "Ночница Ведана", "Беззубый Ург", "Черноокая Морена",
+         "Скрежет", "Плакальщица Курганов", "Древоглав", "Хозяин Пещеры"),
+        ("Чудовище", "Дракон", "Трупоед", "Вампир", "Призрак", "Инсектоид", "Огр", "Реликт",
+         "Проклятый", "Дикая Охота, Воин"),
+        "о голоде, страхе, проклятиях, тьме и о том, что люди — лишь добыча",
+        ("Ты боишься темноты? Правильно делаешь.", "Голод не знает ни чести, ни жалости.",
+         "Когда туман сгущается — молись.", "Люди строят стены. Мы ждём, пока они уснут.",
+         "Кости хрустят громче любых клятв.", "Охота началась задолго до твоего рождения."),
         (
             "Завещание: создайте копию этого отряда в случайном ряду.",
             "Размещение: *поглотите* союзный отряд и усильтесь на его силу.",
@@ -141,13 +179,24 @@ FACTIONS = {
         "a rugged Skellige island warrior with braided hair and war paint, wearing bear-fur mantles, chainmail, "
         "leather and clan armor carved with Celtic knots and runes, an axe or a round shield",
         (
-            "a stormy northern coast, huge waves crashing against black cliffs, a dragon-headed longship in the surf, heavy rain",
-            "a snowy mountain village of carved wooden longhouses, a roaring bonfire, clan banners and smoke from the chimneys",
+            "a stormy northern coast, huge waves crashing against black cliffs, a dragon-headed longship in the surf",
+            "a snowy mountain village of carved wooden longhouses, a roaring bonfire, clan banners and chimney smoke",
             "the deck of a longship in a raging sea storm, torn sail, lightning splitting the dark sky",
+            "a mead hall feast, long tables, roaring hearth, drinking horns raised, carved pillars and shields on the walls",
+            "a sacred grove of Freya with standing runestones and a misty fjord below",
+            "a burning coastal raid at night, longships beached on the shore, flames reflecting in the dark water",
         ),
         "Color palette: icy blues, earthy browns, steel grey, sea-foam white.",
         "Размещение, Приказ, Берсерк, Адреналин, Жажда крови, Ветеран, Сброс, Кровотечение, Броня",
-        "суровое островное имя с прозвищем (например «Хьялмар ан Крайт», «Свеннбьорн Секира», «Бирна Бран»)",
+        ("Хьялмар ан Крайт", "Свеннбьорн Секира", "Бирна Бран", "Ульф Солёная Борода", "Сигрун Штормовая",
+         "Торвальд Медвежья Лапа", "Харальд Кривой Клинок", "Ингрид Рыжая", "Бьорн Китобой", "Асгейр ан Тордаррох",
+         "Хальвдан Громогласный", "Ровена Чёрный Парус", "Эйвинд Одноглазый", "Гудрун Ледяная", "Кнут Кровавый Рог"),
+        ("Человек, Воин", "Человек, Берсерк", "Человек, Мореход", "Человек, Друид", "Человек, Клан Ан Крайт",
+         "Человек, Ярл", "Человек, Налётчик", "Человек, Жрица"),
+        "о море, чести, славной смерти в бою, клане и пиршественных чертогах",
+        ("Море не прощает трусов.", "Умри с топором в руке — и скальды споют о тебе.",
+         "Шторм — лучшее время для набега.", "Клан превыше крови. Кровь превыше золота.",
+         "Мёд льётся рекой, пока точатся секиры.", "Кто боится волн, тот не видел берсерка."),
         (
             "Берсерк: когда сила этого отряда падает до 4 ед. или ниже, превратите его в Медведя.",
             "Размещение: сбросьте карту из руки и возьмите новую.",
@@ -161,12 +210,24 @@ FACTIONS = {
         "a long sword and a kite shield with a royal coat of arms",
         (
             "the war-torn courtyard of a besieged stone castle, trebuchets, arrows in the sky, blue and silver royal banners",
-            "a royal throne hall lit by candles and stained-glass windows, heraldic tapestries and banners of the Northern kingdoms",
+            "a royal throne hall lit by candles and stained-glass windows, heraldic tapestries and banners",
             "a misty battlefield at dawn, ranks of knights and crossbowmen, siege towers and fluttering lion banners",
+            "a tournament field with colorful pavilions, a jousting lane and cheering crowds",
+            "the muddy war camp of the Blue Stripes commandos in a pine forest, campfires and stacked spears",
+            "the city walls of Vizima at sunset, a moat, a drawbridge and patrolling guards with halberds",
         ),
         "Color palette: royal blue, bright steel, red accents, warm golden sunlight.",
         "Размещение, Приказ, Заряд, Экипаж, Воодушевление, Щит, Броня, Усиление, Ходов до восстановления",
-        "благородное имя рыцаря или короля (например «Король Демавенд», «Вернон Роше», «Сэр Ян Натали»)",
+        ("Король Демавенд", "Вернон Роше", "Сэр Ян Натали", "Сигизмунд Дийкстра", "Бьянка Синие Полоски",
+         "Сэр Эльдрик из Аэдирна", "Барон Олгерд Кровавый", "Леди Мирабелла Темерская", "Сэр Гаскон Драконоборец",
+         "Капитан Рейнард Вейл", "Сэр Освальд Седой", "Граф Ульрих Бранвен", "Сестра Альмира", "Маршал Котт",
+         "Сэр Тристан Каэдвенский"),
+        ("Человек, Солдат", "Человек, Рыцарь", "Человек, Аристократ", "Человек, Машина", "Человек, Арбалетчик",
+         "Человек, Чародейка", "Человек, Синие Полоски", "Человек, Офицер"),
+        "о чести, верности короне, защите родной земли и рыцарском долге",
+        ("За Темерию! До последнего вздоха.", "Корона тяжела, но меч тяжелее.",
+         "Рыцарь без чести — просто человек в железе.", "Стены падают. Знамёна — никогда.",
+         "Север помнит каждого, кто за него пал.", "Клятва дана — значит, держи строй."),
         (
             "Приказ: усильте союзный отряд на 2 ед. Заряд: 3.",
             "Размещение: наложите *Щит* на союзный отряд.",
@@ -179,13 +240,24 @@ FACTIONS = {
         "a cunning Novigrad criminal in a lavish but frayed velvet coat, gold rings and chains, a hidden dagger, "
         "a shady conspiratorial smirk",
         (
-            "a narrow Novigrad alley at night, wet cobblestones reflecting orange lanterns, rain, shadowy figures in the doorways",
+            "a narrow Novigrad alley at night, wet cobblestones reflecting orange lanterns, rain, shadowy figures in doorways",
             "a smoky gambling den lit by candles, tables piled with gold coins, dice and cards, thugs watching from the shadows",
             "the Novigrad harbour docks at sunset, merchant ships, crates of contraband and the city walls behind",
+            "a decadent bathhouse with marble pools, steam, lanterns and masked guests whispering deals",
+            "a dark underground fight pit surrounded by a shouting crowd throwing coins",
+            "a counting room of a crime lord, ledgers, chests of gold, a huge vault door and candles",
         ),
         "Color palette: rich purple, gold, murky greens, deep shadows.",
         "Размещение, Приказ, Выгода, Подношение, Награда за голову, Накопление, Безумие, монеты",
-        "имя или кличка бандита (например «Франческо Красавчик», «Сиги Ройвен», «Карась Беззубый»)",
+        ("Франческо Красавчик", "Сиги Ройвен", "Карась Беззубый", "Мадам Ирис Шёлк", "Ловкач Тибальт",
+         "Горбатый Бруно", "Сестра Кошель", "Лука Два Ножа", "Ветка Удавка", "Старый Меняла Гиль",
+         "Жозефина Бархатная", "Риго Скупердяй", "Марко Лисий Хвост", "Тётушка Гризельда", "Фитиль"),
+        ("Человек, Преступник", "Человек, Ростовщик", "Человек, Наёмник", "Краснолюд, Контрабандист",
+         "Человек, Охотник за колдуньями", "Человек, Шулер", "Человек, Убийца", "Половинчик, Вор"),
+        "о деньгах, долгах, сделках, предательстве и цене жизни",
+        ("Всё имеет цену. Особенно молчание.", "Долг платежом красен — особенно с процентами.",
+         "Честных людей нет. Есть недорогие.", "В Новиграде даже крысы платят налог.",
+         "Кто держит кошель, тот держит город.", "Нож в спину — тоже деловое предложение."),
         (
             "Размещение: получите 4 монеты.",
             "Приказ: потратьте 3 монеты и нанесите 4 ед. урона вражескому отряду.",
@@ -201,10 +273,22 @@ FACTIONS = {
             "an ancient magical forest, colossal mossy oaks, crumbling white marble elven ruins, shafts of golden light",
             "a forest road in autumn, an ambush among red and orange trees, arrows flying, falling leaves",
             "moonlit elven ruins with waterfalls and glowing flowers in the valley of Dol Blathanna",
+            "the heart of Brokilon forest, giant twisted trees, dryads' hanging bridges and luminous mushrooms",
+            "a dwarven mountain forge in Mahakam, glowing furnaces, anvils and carved stone halls",
+            "a misty river crossing at dawn, elven archers hidden among reeds and willow trees",
         ),
         "Color palette: forest greens, autumn browns, golden light, earthy tones.",
         "Размещение, Приказ, Гармония, Засада, Симбиоз, Перемещение, Усиление, Яд",
-        "эльфийское имя (например «Иорвет», «Тораль Иаллисен», «Эльдаин аэп Каэлл»)",
+        ("Иорвет", "Тораль Иаллисен", "Эльдаин аэп Каэлл", "Аэлирэнн Ветреница", "Киаран аэп Эасниллен",
+         "Брайна Сосновая Игла", "Финдабар Тихий Шаг", "Мильва Серебряная Стрела", "Варрен Дуб",
+         "Ястреб из Дол Блатанны", "Иннира Ночная Роса", "Барклай Эльс", "Ольгерд Рыжебородый", "Сиана Лунный Луч",
+         "Терн аэп Маэль"),
+        ("Эльф, Солдат", "Эльф, Лучник", "Краснолюд, Солдат", "Дриада", "Эльф, Чародейка", "Краснолюд, Кузнец",
+         "Гном, Инженер", "Эльф, Командир"),
+        "о свободе Старших Народов, мести людям, лесе и древней памяти эльфов",
+        ("Лес помнит каждого, кто рубил его деревья.", "Мы были здесь первыми. Мы будем здесь последними.",
+         "Стрела не спрашивает, кто прав.", "Свобода пахнет хвоей и кровью.",
+         "Люди называют это засадой. Мы — справедливостью.", "Va fail, dh'oine. Лес тебя не отпустит."),
         (
             "Гармония: усильте этот отряд на 1 ед.",
             "Засада: когда противник сыграет отряд, переверните эту карту и нанесите ему 4 ед. урона.",
@@ -218,12 +302,23 @@ FACTIONS = {
         "and the hilts of two swords over the shoulder",
         (
             "a dim medieval tavern, heavy oak tables, candles, ale barrels and blurry patrons in the background",
-            "a misty crossroads at dusk with an old signpost, a gallows and a dark forest behind",
+            "a misty crossroads with an old signpost, a gallows and a dark forest behind",
             "the snowy ruins of an ancient witcher keep high in the mountains, broken walls and a cold wind",
+            "a sorcerer's tower laboratory, floating books, glowing potions and a swirling portal",
+            "a monster's nest in a burned barn, claw marks and torchlight, a contract notice nailed to a post",
+            "a wide river valley with a ferry and a wooden watermill in the rain",
         ),
         "Color palette: dark leather browns, silver, muted greys, warm orange firelight.",
         "Размещение, Приказ, Обречённость, Рвение, Кровотечение, Щит, Усиление",
-        "имя странника с прозвищем (например «Геральт из Ривии», «Ламберт», «Золтан Хивай»)",
+        ("Ламберт Злоязыкий", "Эскель Терпеливый", "Весемир Старший", "Странник из Ривии", "Золтан Хивай",
+         "Лютик Певчий", "Ведьмак Аркас", "Чародейка Илзе", "Бродяга Пётр Седой", "Наёмница Ворона",
+         "Мастер Лавк", "Охотник Брам", "Знахарка Морена", "Кот из Хаэрн Кадух", "Безымянный Странник"),
+        ("Ведьмак", "Человек, Чародей", "Человек, Наёмник", "Краснолюд, Странник", "Человек, Бард",
+         "Человек, Охотник", "Мутант", "Человек, Знахарь"),
+        "о ремесле ведьмака, дороге, нейтралитете, монетах за контракт и выборе меньшего зла",
+        ("Сталь — для людей, серебро — для чудовищ.", "Меньшее зло всё равно остаётся злом.",
+         "Плати вперёд — и я убью твоё чудовище.", "Дорога длинная, а монет всегда мало.",
+         "Мне всё равно, чьё знамя. Важно, чей кошель.", "Мутации не убивают чувства. Только прячут."),
         (
             "Размещение: нанесите 4 ед. урона вражескому отряду.",
             "Приказ: усильте союзный отряд на 3 ед.",
@@ -242,6 +337,15 @@ ART_POSES = (
     "gripping a weapon with both hands, leaning slightly forward",
     "with a cloak billowing in the wind, looking into the distance",
     "pointing forward as if commanding troops into battle",
+    "kneeling on one knee, leaning on a planted sword",
+    "walking toward the viewer through smoke and embers",
+    "drawing a blade from its scabbard",
+    "seated on a rough wooden throne, chin resting on a fist",
+)
+ART_MOODS = (
+    "at dusk under a dramatic orange sky", "in heavy rain", "in drifting snowfall", "in thick rolling fog",
+    "under a stormy sky with lightning", "at golden hour", "by moonlight", "amid swirling embers and smoke",
+    "at cold grey dawn", "in a sudden gust of wind with flying leaves",
 )
 
 FRAMES = {"gold": "Золотая", "bronze": "Бронзовая"}
@@ -385,8 +489,8 @@ def send_sub_request(chat_id: int):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("📢 Пойти в пещеру (Подписаться)", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}"))
     markup.add(types.InlineKeyboardButton("🔄 Я подписался!", callback_data="check_sub"))
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "gate",
         "🛑 <b>СТОЯТЬ, ЧЕЛОВЕЧЕ!</b>\nЛавк не пускает чужаков. Сначала зайди в мою пещеру "
         "(подпишись на канал), а потом будем делать картищи!",
         reply_markup=markup,
@@ -417,8 +521,8 @@ def topup_button_markup():
 
 
 def send_not_enough(chat_id: int, price: int):
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "topup",
         f"💸 <b>Ууу, мешочек пустоват!</b>\nНужно {price}⭐, а у тебя {balance_of(chat_id)}⭐.\n"
         "Подкинь звёзд — и Лавк сразу возьмётся за кисть!",
         reply_markup=topup_button_markup(),
@@ -457,6 +561,115 @@ def card_markup(card: dict, with_deck: bool = False):
         markup.add(types.InlineKeyboardButton("📜 К колоде", callback_data="deck:0"))
     return markup
 
+
+
+# ==========================================
+# 2б. КАРТИНКИ ЛАВКА НА КАЖДОМ ЭКРАНЕ
+# ==========================================
+# Рисуются один раз из админки (Fal Kontext по образцу WELCOME_IMAGE) и лежат в постоянном хранилище.
+SCENE_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "scenes")
+CAPTION_LIMIT = 1000   # у Telegram 1024 символа на подпись к фото, оставляем запас
+SCENES = {
+    "gate": ("Вход в пещеру", "standing in the entrance of his cave with a raised palm, blocking the way, stern but friendly"),
+    "create": ("Создание", "holding up an empty ornate wooden picture frame toward the viewer as if asking for a portrait"),
+    "faction": ("Фракция", "standing in front of seven hanging war banners: black with a golden sun, blue with golden lilies, "
+                           "green with leaves, purple with gold coins, dark red with a skull, sea-blue with an anchor, grey with a wolf"),
+    "name": ("Имя", "writing with a long quill on an unrolled parchment scroll"),
+    "category": ("Категория", "studying a huge old bestiary book full of drawings of races and creatures"),
+    "power": ("Сила", "lifting a heavy two-handed sword with a proud grin, flexing"),
+    "armor": ("Броня", "knocking with his knuckles on a battered steel kite shield"),
+    "provision": ("Наём", "sitting at a table with bread, cheese, a ham and a tankard of ale, counting the food"),
+    "frame": ("Редкость", "holding an ornate golden card frame in one hand and a bronze one in the other, comparing them"),
+    "ability": ("Способность", "casting glowing magical runes from his fingertips"),
+    "quote": ("Цитата", "reading aloud from an old book by candlelight with one finger raised"),
+    "spirits": ("Духи", "gazing into a glowing crystal ball surrounded by faint ghostly spirits"),
+    "wait": ("Рисует", "painting energetically at a wooden easel with a brush and palette, paint splashes around"),
+    "error": ("Ошибка", "scratching his head over a knocked-over paint pot and a ruined canvas"),
+    "deck": ("Колода", "shuffling a deck of Gwent cards at a tavern table, cards fanned out"),
+    "profile": ("Профиль", "looking at himself in a tall ornate mirror and adjusting his collar"),
+    "topup": ("Пополнение", "holding an open leather pouch overflowing with glowing golden stars"),
+    "pouch": ("Звёзды получены", "happily tossing glowing golden stars into the air from a full pouch"),
+    "invite": ("Друзья", "waving welcomingly at the entrance of his cave, inviting friends in"),
+    "promo": ("Промокод", "holding a letter with a glowing magical wax seal, breaking it open"),
+    "support": ("Поддержка", "holding a warm glowing lantern and offering a helping hand"),
+    "terms": ("Условия", "holding up a long parchment of rules with a wax seal"),
+    "edit": ("Правка", "retouching a painting with a fine brush and a magnifying glass"),
+    "cancel": ("Отмена", "rolling up a canvas with a disappointed sigh"),
+    "confused": ("Не понял", "shrugging with a puzzled face, a question mark of smoke above his head"),
+    "admin": ("Админка", "sitting on a rough stone throne in his cave like a king, holding a goblet"),
+}
+_scene_file_ids: dict[tuple, str] = {}
+_scene_lock = threading.Lock()
+
+
+def scene_path(key: str) -> str:
+    return os.path.join(SCENE_DIR, f"{key}.jpg")
+
+
+def scene_source(key: str) -> Optional[str]:
+    for path in (scene_path(key), os.path.join(BASE_DIR, "assets", "lavk", f"{key}.jpg")):
+        if os.path.exists(path):
+            return path
+    return WELCOME_IMAGE if os.path.exists(WELCOME_IMAGE) else None
+
+
+def is_photo(message) -> bool:
+    return getattr(message, "content_type", None) == "photo"
+
+
+def send_screen(chat_id: int, key: str, text: str, reply_markup=None):
+    """Экран с картинкой Лавка сверху. Без картинки или при ошибке — просто текст."""
+    src = scene_source(key)
+    if src is None:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    cache_key = (src, os.path.getmtime(src))
+    long_text = len(text) > CAPTION_LIMIT
+    caption, markup = (None, None) if long_text else (text, reply_markup)
+    try:
+        if cache_key in _scene_file_ids:
+            msg = bot.send_photo(chat_id, _scene_file_ids[cache_key], caption=caption, reply_markup=markup)
+        else:
+            with open(src, "rb") as photo:
+                msg = bot.send_photo(chat_id, photo, caption=caption, reply_markup=markup)
+            _scene_file_ids[cache_key] = msg.photo[-1].file_id
+    except (apihelper.ApiTelegramException, OSError) as e:
+        logger.warning("Картинка экрана %s не отправилась: %s", key, e)
+        _scene_file_ids.pop(cache_key, None)
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    if long_text:
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    return msg
+
+
+def edit_screen(chat_id: int, message, text: str, reply_markup=None):
+    """Меняет текст экрана: у сообщения с картинкой — подпись, у текстового — сам текст."""
+    message_id = message.message_id
+    if is_photo(message):
+        return safe_call(bot.edit_message_caption, text, chat_id, message_id, reply_markup=reply_markup)
+    return safe_call(bot.edit_message_text, text, chat_id, message_id, reply_markup=reply_markup)
+
+
+def draw_scene(key: str) -> None:
+    """Рисует картинку экрана по образцу приветственной картинки Лавка."""
+    if not os.path.exists(WELCOME_IMAGE):
+        raise FalError(f"нет образца {os.path.basename(WELCOME_IMAGE)} рядом с main.py")
+    with open(WELCOME_IMAGE, "rb") as f:
+        reference = to_data_uri(f.read(), "image/jpeg")
+    action = SCENES[key][1]
+    art = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
+        "prompt": (f"Keep this exact character — the same face, hair, beard, body, clothes and painting style. "
+                   f"Now show him {action}. Cozy candle-lit cave workshop of a painter in the world of The Witcher, "
+                   "hand-painted Gwent card art style, warm light, detailed background."),
+        "image_url": reference,
+        "aspect_ratio": "4:3",
+        "guidance_scale": 3.5,
+        "output_format": "jpeg",
+    })
+    os.makedirs(SCENE_DIR, exist_ok=True)
+    tmp = scene_path(key) + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(art)
+    os.replace(tmp, scene_path(key))
 
 # ==========================================
 # 3. ДОСТУП: только личка, блокировка, учёт пользователей
@@ -578,7 +791,13 @@ def generate_value(step: Step, faction_name: str) -> str:
     if step.random_range:
         return str(random.randint(*step.random_range))
     faction = FACTION_BY_NAME.get(faction_name, FACTIONS["Neutral"])
-    prompt = step.ai_prompt.format(faction=faction.name, mechanics=faction.mechanics, name_hint=faction.name_hint)
+    prompt = step.ai_prompt.format(
+        faction=faction.name, mechanics=faction.mechanics, quote_theme=faction.quote_theme,
+        # Случайная выборка примеров каждый раз — иначе Gemini крутится вокруг одних и тех же имён.
+        names=", ".join(random.sample(faction.names, 4)),
+        categories=", ".join(random.sample(faction.categories, 3)),
+        quotes=" / ".join(random.sample(faction.quotes, 2)),
+    )
     for _ in range(2):
         value = ask_gemini(prompt, keep_markup=step.keep_markup)
         if value is None:
@@ -590,7 +809,9 @@ def generate_value(step: Step, faction_name: str) -> str:
             logger.info("Способность не в духе фракции %s: %r", faction.name, value)
             continue
         return value
-    return random.choice(faction.fallbacks if step.key == "ability" else step.fallbacks)
+    own_fallbacks = {"ability": faction.fallbacks, "name": faction.names, "category": faction.categories,
+                     "quote": faction.quotes}
+    return random.choice(own_fallbacks.get(step.key) or step.fallbacks)
 
 
 STEPS = {
@@ -601,8 +822,9 @@ STEPS = {
         "<i>Например: «Кирилл Беспощадный», «Старый Волк», «Ярл Бьорн Седобородый», «Мастер Лавк».</i>\n"
         "До 35 символов.",
         text_validator(35), STATE_CATEGORY,
-        ai_prompt=("Придумай имя для персонажа карты Гвинта, фракция {faction}: {name_hint}. "
-                   "Не используй существующих персонажей. 1-3 слова. Только имя."),
+        ai_prompt=("Придумай новое имя для персонажа карты Гвинта за фракцию {faction}. Оно должно звучать "
+                   "как имена этой фракции, например: {names}. Можно с прозвищем или титулом. "
+                   "Не повторяй примеры и не бери известных персонажей. 1-4 слова, до 35 символов. Только имя."),
         fallbacks=("Грозный Воин", "Старый Волк"),
     ),
     STATE_CATEGORY: Step(
@@ -612,7 +834,8 @@ STEPS = {
         "<i>Например: «Человек, Солдат», «Эльф, Лучник», «Краснолюд, Кузнец», «Ведьмак», «Вампир», "
         "«Человек, Чародей».</i>",
         text_validator(30, max_words=3), STATE_POWER,
-        ai_prompt="Придумай категорию для карты Гвинта, фракция {faction}, в формате «Раса, Ремесло», например «Человек, Солдат». 1-3 слова. Только категория.",
+        ai_prompt=("Придумай категорию для карты Гвинта за фракцию {faction} в формате «Раса, Ремесло», "
+                   "как у этой фракции, например: {categories}. 1-3 слова. Только категория."),
         fallbacks=("Человек, Воин", "Человек, Наёмник"),
     ),
     STATE_POWER: Step(
@@ -665,7 +888,9 @@ STEPS = {
         "<i>Например: «Сталь — для людей, серебро — для чудовищ.», «Долг платежом красен, особенно с процентами.», "
         "«Море не прощает трусов.»</i>\nДо 150 символов.",
         text_validator(150), STATE_CONFIRM,
-        ai_prompt="Сгенерируй мрачную цитату персонажа для карты Гвинт, фракция {faction}, в духе мира Ведьмака. Максимум 20 слов. Без кавычек.",
+        ai_prompt=("Сгенерируй новую цитату персонажа для карты Гвинт за фракцию {faction} — {quote_theme}. "
+                   "В духе мира Ведьмака, мрачно или с чёрным юмором, как: {quotes}. "
+                   "Не повторяй примеры. Максимум 20 слов. Без кавычек."),
         fallbacks=("Смерть — лишь начало.",),
     ),
 }
@@ -696,8 +921,8 @@ def frame_markup():
 def go_to(chat_id: int, state: int, prefix: str = ""):
     user_states[chat_id] = state
     if state == STATE_FRAME:
-        bot.send_message(
-            chat_id,
+        send_screen(
+            chat_id, "frame",
             prefix + "🖼 <b>Какой редкости будет твоя карта?</b>\n\n"
             "🟡 <b>Золотая</b> — легенды и герои: уникальный персонаж, золотая рамка.\n"
             "🟤 <b>Бронзовая</b> — простые бойцы, отряды и наёмники: бронзовая рамка.",
@@ -709,7 +934,7 @@ def go_to(chat_id: int, state: int, prefix: str = ""):
         ask_for_confirmation(chat_id)
     else:
         step = STEPS[state]
-        bot.send_message(chat_id, prefix + step.prompt, reply_markup=gen_ai_markup(step.key))
+        send_screen(chat_id, step.key, prefix + step.prompt, reply_markup=gen_ai_markup(step.key))
 
 
 def price_line(chat_id: int, price: int, trial_ok: bool = False) -> str:
@@ -758,11 +983,7 @@ def show_welcome(chat_id: int):
     )
     if has_trial(chat_id) and not is_free(chat_id):
         text += "\n\n🎁 <b>Первая картища — в подарок!</b> Жми «Создать карту»."
-    if os.path.exists(WELCOME_IMAGE):
-        with open(WELCOME_IMAGE, "rb") as photo:
-            bot.send_photo(chat_id, photo, caption=text, reply_markup=get_main_menu(chat_id))
-    else:
-        bot.send_message(chat_id, text, reply_markup=get_main_menu(chat_id))
+    send_screen(chat_id, "welcome", text, reply_markup=get_main_menu(chat_id))
 
 
 def show_profile(chat_id: int):
@@ -786,7 +1007,7 @@ def show_profile(chat_id: int):
         types.InlineKeyboardButton("🔗 Позвать друзей", callback_data="menu:invite"),
     )
     markup.add(types.InlineKeyboardButton("🎟 Ввести промокод", callback_data="promo"))
-    bot.send_message(chat_id, text, reply_markup=markup)
+    send_screen(chat_id, "profile", text, reply_markup=markup)
 
 
 def show_invite(chat_id: int):
@@ -804,7 +1025,7 @@ def show_invite(chat_id: int):
     markup.add(types.InlineKeyboardButton(
         "📤 Поделиться ссылкой", url=f"https://t.me/share/url?url={quote(link)}&text={quote(share_text)}"
     ))
-    bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
+    send_screen(chat_id, "invite", text, reply_markup=markup)
 
 
 def pack_label(pay: int, credit: int) -> str:
@@ -827,8 +1048,8 @@ def show_topup(chat_id: int):
         f"• <b>{pay}⭐</b> → {credit}⭐ в мешочек ({plural_cards(credit // GENERATION_PRICE)})"
         for pay, credit in TOPUP_PACKS
     )
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "topup",
         "💰 <b>Пополнить мешочек</b>\n\n"
         f"Сейчас в мешочке: <b>{balance_text(chat_id)}</b>\n"
         f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐\n\n"
@@ -859,13 +1080,13 @@ def send_topup_invoice(chat_id: int, pay: int, credit: int):
 
 def ask_promo(chat_id: int):
     user_states[chat_id] = STATE_PROMO
-    bot.send_message(chat_id, "🎟 <b>Впиши промокод</b> — Лавк проверит, настоящий ли он.",
-                     reply_markup=get_cancel_menu())
+    send_screen(chat_id, "promo", "🎟 <b>Впиши промокод</b> — Лавк проверит, настоящий ли он.\n\n"
+                "<i>Промокоды Лавк раздаёт в своём канале и на праздники.</i>", reply_markup=get_cancel_menu())
 
 
 def show_support(chat_id: int):
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "support",
         "🆘 <b>Поддержка</b>\n\n"
         f"Что-то сломалось, картища вышла кривой или звёзды потерялись? Пиши смотрителю пещеры: {SUPPORT_CONTACT}\n\n"
         "Чтобы помочь быстрее, сразу укажи свой ID: "
@@ -899,17 +1120,19 @@ def deck_markup(chat_id: int, page: int):
     return total, markup
 
 
-def show_deck(chat_id: int, page: int = 0, message_id: Optional[int] = None):
+def show_deck(chat_id: int, page: int = 0, message=None):
+    """message — экран колоды, который можно перелистнуть на месте (кнопки ◀️ ▶️)."""
     total, markup = deck_markup(chat_id, page)
     if not total:
-        bot.send_message(chat_id, "📜 <b>Твоя колода пуста, человече!</b>\n\n"
-                                  f"Жми «{BTN_CREATE}» — и Лавк нарисует первую картищу.")
+        send_screen(chat_id, "deck", "📜 <b>Твоя колода пуста, человече!</b>\n\n"
+                                     f"Жми «{BTN_CREATE}» — и Лавк нарисует первую картищу.")
         return
-    text = f"📜 <b>Твоя колода</b> — {plural_cards(total)}\n\nВыбирай картищу, чтобы посмотреть или заказать правку:"
-    if message_id:
-        if safe_call(bot.edit_message_text, text, chat_id, message_id, reply_markup=markup) is not None:
-            return
-    bot.send_message(chat_id, text, reply_markup=markup)
+    rank, _ = rank_info(total)
+    text = (f"📜 <b>Твоя колода</b> — {plural_cards(total)}\n🏅 {rank}\n\n"
+            "Выбирай картищу, чтобы посмотреть или заказать правку:")
+    if message is not None and edit_screen(chat_id, message, text, reply_markup=markup) is not None:
+        return
+    send_screen(chat_id, "deck", text, reply_markup=markup)
 
 
 # ==========================================
@@ -939,8 +1162,8 @@ def cmd_menu(message):
 
 @bot.message_handler(commands=["paysupport"])
 def cmd_paysupport(message):
-    bot.send_message(
-        message.chat.id,
+    send_screen(
+        message.chat.id, "support",
         "💳 <b>Вопросы по оплате</b>\n\n"
         f"Если звёзды списались, а мешочек не пополнился, или нужен возврат — напиши {SUPPORT_CONTACT} "
         f"и укажи свой ID <code>{message.chat.id}</code>. Лавк разберётся!",
@@ -949,8 +1172,8 @@ def cmd_paysupport(message):
 
 @bot.message_handler(commands=["terms"])
 def cmd_terms(message):
-    bot.send_message(
-        message.chat.id,
+    send_screen(
+        message.chat.id, "terms",
         "📜 <b>Условия пещеры Лавка</b>\n\n"
         "1. Звёзды, внесённые в мешочек, тратятся на создание картищ "
         f"({GENERATION_PRICE}⭐) и правки ({EDIT_PRICE}⭐).\n"
@@ -968,7 +1191,7 @@ def cancel_input(message):
     reset_user(chat_id)
     text = ("⏳ Картища уже рисуется — духов не остановить. Лавк пришлёт её, как закончит!"
             if chat_id in busy_users else "Эх, Лавк убирает холст. Если захочешь новую картищу — жми кнопку!")
-    bot.send_message(chat_id, text, reply_markup=get_main_menu(chat_id))
+    send_screen(chat_id, "wait" if chat_id in busy_users else "cancel", text, reply_markup=get_main_menu(chat_id))
 
 
 @bot.message_handler(commands=["promo"])
@@ -1010,7 +1233,7 @@ def menu_deck(message):
 def start_creation(message):
     chat_id = message.chat.id
     if chat_id in busy_users:
-        bot.send_message(chat_id, "⏳ Лавк ещё рисует твою прошлую картищу, подожди!")
+        send_screen(chat_id, "wait", "⏳ Лавк ещё рисует твою прошлую картищу, подожди!")
         return
     if not check_sub(message.from_user.id):
         send_sub_request(chat_id)
@@ -1020,8 +1243,8 @@ def start_creation(message):
         return
     user_data[chat_id] = {}
     user_states[chat_id] = STATE_PHOTO
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "create",
         "📸 <b>Сначала давай лицо!</b>\n\nЧеловече давать хорошую картинку. Без теней, без темных стекол "
         "на глазах и чтобы ничего не закрывало! Духам нужно видеть твои черты, чтобы красиво перенести "
         "на холст. Плохое лицо — плохая картища!\n\n"
@@ -1065,8 +1288,8 @@ def cb_topup(call):
     safe_call(bot.answer_callback_query, call.id)
     if value == "custom":
         user_states[chat_id] = STATE_TOPUP_AMOUNT
-        bot.send_message(chat_id, f"✍️ Сколько звёзд насыпать? Впиши число от {TOPUP_MIN} до {TOPUP_MAX}.",
-                         reply_markup=get_cancel_menu())
+        send_screen(chat_id, "topup", f"✍️ <b>Сколько звёзд насыпать?</b>\n\nВпиши число от {TOPUP_MIN} до {TOPUP_MAX}. "
+                    "Своя сумма зачисляется один к одному — выгоднее брать наборы.", reply_markup=get_cancel_menu())
         return
     if value.isdigit() and int(value) in dict(TOPUP_PACKS):
         send_topup_invoice(chat_id, int(value), dict(TOPUP_PACKS)[int(value)])
@@ -1123,8 +1346,8 @@ def successful_payment(message):
         if credit > payment.total_amount:
             db.add_balance(chat_id, credit - payment.total_amount, "topup_bonus")
         logger.info("Пополнение %s на %s⭐ (+%s⭐ в мешочек)", chat_id, payment.total_amount, credit)
-    bot.send_message(
-        chat_id,
+    send_screen(
+        chat_id, "pouch",
         f"💰 <b>Звёзды в мешочке!</b> +{credit}⭐\n"
         f"Теперь у тебя: <b>{balance_text(chat_id)}</b>. Лавк уже точит кисть!",
         reply_markup=get_main_menu(chat_id),
@@ -1152,12 +1375,12 @@ def process_photo(message):
     user_states[chat_id] = STATE_FACTION
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(*[types.InlineKeyboardButton(f.button, callback_data=f"faction:{key}") for key, f in FACTIONS.items()])
-    about = "\n\n".join(f"<b>{f.button}</b> — {f.about}" for f in FACTIONS.values())
-    bot.send_message(
-        chat_id,
-        "🏴 <b>За кого воевать будешь?</b>\n\n"
-        "От фракции зависят рамка, цвета шапки, наряд и фон на арте, а духи будут придумывать "
-        f"способности в её стиле.\n\n{about}\n\n<b>Выбирай знамя, человече!</b>",
+    about = "\n".join(f"<b>{f.button}</b> — {f.about}" for f in FACTIONS.values())
+    send_screen(
+        chat_id, "faction",
+        "🏴 <b>За кого воевать будешь?</b>\n"
+        "<i>От фракции зависят шапка карты, наряд и фон арта, имена и способности.</i>\n\n"
+        f"{about}\n\n<b>Выбирай знамя, человече!</b>",
         reply_markup=markup,
     )
 
@@ -1173,8 +1396,7 @@ def cb_faction(call):
     user_data[chat_id]["faction"] = faction.name
     user_data[chat_id]["faction_key"] = faction_key
     safe_call(bot.answer_callback_query, call.id)
-    safe_call(bot.edit_message_text, f"✅ Фракция: <b>{esc(faction.button)}</b>\n<i>{esc(faction.about)}</i>",
-              chat_id, call.message.message_id)
+    edit_screen(chat_id, call.message, f"✅ Фракция: <b>{esc(faction.button)}</b>\n<i>{esc(faction.about)}</i>")
     go_to(chat_id, STATE_NAME)
 
 
@@ -1187,7 +1409,7 @@ def cb_frame(call):
         return
     user_data[chat_id]["frame"] = FRAMES[frame_key]
     safe_call(bot.answer_callback_query, call.id)
-    safe_call(bot.edit_message_text, f"✅ Редкость: <b>{esc(FRAMES[frame_key])}</b>", chat_id, call.message.message_id)
+    edit_screen(chat_id, call.message, f"✅ Редкость: <b>{esc(FRAMES[frame_key])}</b>")
     go_to(chat_id, STATE_ABILITY)
 
 
@@ -1236,7 +1458,7 @@ def cb_spirits(call):
     user_states[chat_id] = STATE_SPIRITS
     safe_call(bot.answer_callback_query, call.id, "Духи думают...")
     # Убираем кнопки сразу, чтобы повторное нажатие не запустило вторую генерацию.
-    safe_call(bot.edit_message_text, random.choice(SPIRIT_PHRASES), chat_id, call.message.message_id)
+    edit_screen(chat_id, call.message, random.choice(SPIRIT_PHRASES))
     threading.Thread(
         target=run_spirits, args=(chat_id, state, kind == "aiall", call.message.message_id), daemon=True
     ).start()
@@ -1253,8 +1475,8 @@ def cb_confirm(call):
         safe_call(bot.answer_callback_query, call.id)
         reset_user(chat_id)
         safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
-        bot.send_message(chat_id, "Эх, порвали холст! Начинай заново, когда будешь готов.",
-                         reply_markup=get_main_menu(chat_id))
+        send_screen(chat_id, "cancel", "Эх, порвали холст! Начинай заново, когда будешь готов.",
+                    reply_markup=get_main_menu(chat_id))
         return
 
     if chat_id in busy_users:
@@ -1293,10 +1515,10 @@ def cb_deck(call):
         return
     if action == "deck":
         safe_call(bot.answer_callback_query, call.id)
-        # Из карточки с фото текст не отредактировать — тогда show_deck пришлёт новое сообщение.
-        # Старые (>48 ч) сообщения приходят как InaccessibleMessage без content_type.
-        is_text = getattr(call.message, "content_type", None) == "text"
-        show_deck(chat_id, int(value), call.message.message_id if is_text else None)
+        # Листаем на месте только сам экран колоды; из карточки картищи — новое сообщение.
+        # Старые (>48 ч) сообщения приходят как InaccessibleMessage без текста.
+        shown = getattr(call.message, "caption", None) or getattr(call.message, "text", None) or ""
+        show_deck(chat_id, int(value), call.message if shown.startswith("📜 Твоя колода") else None)
         return
 
     card = db.get_card(int(value), chat_id)
@@ -1326,25 +1548,41 @@ def cb_deck(call):
         return
     user_data[chat_id] = {"edit_card_id": card["id"]}
     user_states[chat_id] = STATE_EDIT_PROMPT
-    bot.send_message(
-        chat_id,
+    quick = types.InlineKeyboardMarkup(row_width=1)
+    quick.add(*[types.InlineKeyboardButton(label, callback_data=f"editq:{key}") for key, (label, _) in EDIT_QUICK.items()])
+    quick.add(types.InlineKeyboardButton("❌ Отмена", callback_data="editno"))
+    send_screen(
+        chat_id, "edit",
         f"✏️ <b>Правка картищи «{esc(card['data'].get('name', ''))}»</b>\n\n"
-        "Расскажи Лавку, что поправить. Например: <i>«добавь шрам на щеку»</i>, "
-        "<i>«сделай фон ночным»</i>, <i>«дай в руки огненный меч»</i>.\n"
-        "Лицо и стиль картищи духи сохранят.",
-        reply_markup=get_cancel_menu(),
+        "Напиши Лавку, что поправить, — можно менять и героя, и фон. Например:\n"
+        "<i>• «смени фон на заснеженный горный перевал»\n"
+        "• «пусть за спиной горит деревня»\n"
+        "• «добавь шрам на щеку и капюшон»\n"
+        "• «дай в руки огненный меч»</i>\n\n"
+        "Или выбери готовую правку кнопкой. Лицо духи сохранят.",
+        reply_markup=quick,
     )
 
 
-@bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == STATE_EDIT_PROMPT)
-def process_edit_prompt(message):
-    chat_id = message.chat.id
-    text = message.text.strip()
-    error = text_validator(300, min_len=3)(text)
-    if error:
-        bot.send_message(chat_id, error)
-        return
+# Готовые правки: (кнопка, инструкция для модели; {bg} — случайный фон фракции картищи)
+EDIT_QUICK = {
+    "bg": ("🌄 Новый фон в духе фракции",
+           "Replace the entire background with {bg}. Keep the character, face, pose and clothing exactly the same."),
+    "night": ("🌙 Ночная сцена при луне",
+              "Change the scene to a moonlit night: dark blue sky with a full moon, cold moonlight rim light on the "
+              "character, deep shadows. Keep the character, face, pose and clothing exactly the same."),
+    "storm": ("⛈ Буря и молнии",
+              "Replace the background with a raging storm: black clouds, lightning, driving rain and wind. "
+              "Keep the character, face, pose and clothing exactly the same."),
+    "fire": ("🔥 Пожар и искры",
+             "Replace the background with a burning battlefield: flames, smoke and flying embers lighting the scene "
+             "with orange light. Keep the character, face, pose and clothing exactly the same."),
+}
+
+
+def ask_edit_confirm(chat_id: int, text: str, english: Optional[str] = None):
     user_data[chat_id]["edit_prompt"] = text
+    user_data[chat_id]["edit_english"] = english
     user_states[chat_id] = STATE_EDIT_CONFIRM
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1358,18 +1596,48 @@ def process_edit_prompt(message):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("editq:"))
+def cb_edit_quick(call):
+    chat_id = call.message.chat.id
+    key = call.data.split(":", 1)[1]
+    if user_states.get(chat_id) != STATE_EDIT_PROMPT or key not in EDIT_QUICK:
+        safe_call(bot.answer_callback_query, call.id, "Эта кнопка уже не работает.")
+        return
+    safe_call(bot.answer_callback_query, call.id)
+    card = db.get_card(user_data[chat_id]["edit_card_id"], chat_id)
+    if card is None:
+        reset_user(chat_id)
+        return
+    faction = FACTION_BY_NAME.get(card["data"].get("faction"), FACTIONS["Neutral"])
+    label, english = EDIT_QUICK[key]
+    safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
+    ask_edit_confirm(chat_id, label, english.format(bg=random.choice(faction.backgrounds)))
+
+
+@bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == STATE_EDIT_PROMPT)
+def process_edit_prompt(message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    error = text_validator(300, min_len=3)(text)
+    if error:
+        bot.send_message(chat_id, error)
+        return
+    ask_edit_confirm(chat_id, text)
+
+
 @bot.callback_query_handler(func=lambda call: call.data in ("editok", "editno"))
 def cb_edit_confirm(call):
     chat_id = call.message.chat.id
-    if user_states.get(chat_id) != STATE_EDIT_CONFIRM:
+    allowed = (STATE_EDIT_CONFIRM, STATE_EDIT_PROMPT) if call.data == "editno" else (STATE_EDIT_CONFIRM,)
+    if user_states.get(chat_id) not in allowed:
         safe_call(bot.answer_callback_query, call.id, "Эта кнопка уже не работает.")
         return
     if call.data == "editno":
         safe_call(bot.answer_callback_query, call.id)
         reset_user(chat_id)
-        safe_call(bot.edit_message_text, "Эх, отложили кисть.", chat_id, call.message.message_id)
-        bot.send_message(chat_id, "Правку можно заказать в любой момент из «Моих картищ».",
-                         reply_markup=get_main_menu(chat_id))
+        safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
+        send_screen(chat_id, "cancel", "Эх, отложили кисть. Правку можно заказать в любой момент из «Моих картищ».",
+                    reply_markup=get_main_menu(chat_id))
         return
     if chat_id in busy_users:
         bot.answer_callback_query(call.id, "⏳ Лавк ещё рисует прошлую картищу!", show_alert=True)
@@ -1386,11 +1654,12 @@ def cb_edit_confirm(call):
         return
     safe_call(bot.answer_callback_query, call.id)
     instruction = user_data[chat_id]["edit_prompt"]
+    english = user_data[chat_id].get("edit_english")
     reset_user(chat_id)
     busy_users.add(chat_id)
     safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
     bot.send_message(chat_id, f"✅ <b>Правка принята:</b> {esc(instruction)}", reply_markup=get_main_menu(chat_id))
-    threading.Thread(target=edit_card, args=(chat_id, card, instruction, "paid" if paid else "free"),
+    threading.Thread(target=edit_card, args=(chat_id, card, instruction, "paid" if paid else "free", english),
                      daemon=True).start()
 
 
@@ -1398,7 +1667,9 @@ def cb_edit_confirm(call):
 # 13. ГЕНЕРАЦИЯ И ПРАВКА АРТА (Fal.ai)
 # ==========================================
 class FalError(Exception):
-    pass
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def to_data_uri(image_bytes: bytes, mime: str) -> str:
@@ -1406,15 +1677,43 @@ def to_data_uri(image_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
 
+def http_retry(method: str, url: str, attempts: int = 3, **kwargs) -> requests.Response:
+    """Повтор при обрыве сети, 429 и 5xx — самые частые причины «внезапных» сбоев генерации."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+        except requests.RequestException as e:
+            if attempt == attempts:
+                raise FalError("нет связи с художником", retryable=True) from e
+            logger.warning("Fal.ai: сеть (%s), повтор %s/%s", e.__class__.__name__, attempt, attempts)
+        else:
+            if response.status_code != 429 and response.status_code < 500:
+                return response
+            if attempt == attempts:
+                return response
+            logger.warning("Fal.ai: код %s, повтор %s/%s", response.status_code, attempt, attempts)
+        time.sleep(3 * attempt)
+    raise AssertionError("unreachable")
+
+
+def is_blank(image: bytes) -> bool:
+    """Fal заменяет картинки, не прошедшие фильтр, чёрным квадратом."""
+    try:
+        with Image.open(io.BytesIO(image)) as img:
+            return max(img.convert("L").resize((32, 32)).getextrema()) < 12
+    except Exception:
+        return True
+
+
 def request_fal_image(endpoint: str, payload: dict) -> bytes:
     """Генерация через очередь Fal: запрос не висит на одном соединении, есть общий дедлайн."""
     if not FAL_KEY:
         raise FalError("не задан FAL_API_KEY")
     headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
-    response = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+    response = http_retry("POST", endpoint, json=payload, headers=headers, timeout=60)
     if not response.ok:
         logger.error("Fal.ai %s: %s", response.status_code, response.text[:1000])
-        raise FalError(f"Fal.ai вернул код {response.status_code}")
+        raise FalError(f"Fal.ai вернул код {response.status_code}", retryable=response.status_code >= 500)
     job = response.json()
     deadline = time.monotonic() + FAL_DEADLINE
     while True:
@@ -1424,7 +1723,7 @@ def request_fal_image(endpoint: str, payload: dict) -> bytes:
                 requests.put(job["cancel_url"], headers=headers, timeout=15)
             except Exception:
                 logger.exception("Fal.ai: не удалось отменить запрос")
-            raise FalError("художник слишком долго не отвечал")
+            raise FalError("художник слишком долго не отвечал", retryable=True)
         time.sleep(2)
         try:
             status = requests.get(job["status_url"], headers=headers, timeout=30).json().get("status")
@@ -1433,20 +1732,54 @@ def request_fal_image(endpoint: str, payload: dict) -> bytes:
             continue
         if status == "COMPLETED":
             break
-    result = requests.get(job["response_url"], headers=headers, timeout=60)
+    result = http_retry("GET", job["response_url"], headers=headers, timeout=60)
     try:
         result.raise_for_status()
-        image_url = result.json()["images"][0]["url"]
+        body = result.json()
+        image_url = body["images"][0]["url"]
     except (requests.HTTPError, ValueError, KeyError, IndexError, TypeError):
         logger.error("Неожиданный ответ Fal.ai: %s %s", result.status_code, result.text[:1000])
-        raise FalError("Fal.ai вернул ответ без картинки")
-    art = requests.get(image_url, timeout=90)
-    art.raise_for_status()
+        raise FalError("Fal.ai вернул ответ без картинки", retryable=result.status_code >= 500)
+    art = http_retry("GET", image_url, timeout=90)
+    if not art.ok:
+        raise FalError("не удалось скачать картинку", retryable=True)
+    if any(body.get("has_nsfw_concepts") or []) or is_blank(art.content):
+        logger.warning("Fal.ai: картинка отфильтрована (%s)", job.get("request_id"))
+        raise FalError("духи забраковали рисунок", retryable=True)
     return art.content
 
 
+def fal_with_retry(endpoint: str, make_payload: Callable[[], dict]) -> bytes:
+    """Одна повторная попытка при временном сбое; payload собирается заново (новая поза, фон и seed)."""
+    try:
+        return request_fal_image(endpoint, make_payload())
+    except FalError as e:
+        if not e.retryable:
+            raise
+        logger.warning("Fal.ai: %s — пробую ещё раз", e)
+        return request_fal_image(endpoint, make_payload())
+
+
+def tg_retry(func, *args, attempts: int = 3, **kwargs):
+    """Повтор отправки в Telegram при флуд-лимите, 5xx и обрыве связи — чтобы готовая карта не терялась."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except apihelper.ApiTelegramException as e:
+            if attempt == attempts or (e.error_code != 429 and e.error_code < 500):
+                raise
+            delay = int((e.result_json or {}).get("parameters", {}).get("retry_after", 3 * attempt))
+        except requests.ConnectionError:
+            # До сервера запрос не дошёл, повтор не создаст дубль.
+            if attempt == attempts:
+                raise
+            delay = 3 * attempt
+        logger.warning("Telegram: повтор %s через %s с", func.__name__, delay)
+        time.sleep(delay)
+
+
 def download_telegram_file(file_id: str) -> bytes:
-    return bot.download_file(bot.get_file(file_id).file_path)
+    return tg_retry(lambda: bot.download_file(bot.get_file(file_id).file_path))
 
 
 def refund(chat_id: int, price: int, mode: str) -> str:
@@ -1471,68 +1804,70 @@ def award_referrer(user_id: int):
 
 
 ART_STYLE = (
-    "Official GWENT: The Witcher Card Game card illustration, hand-painted digital painting by CD Projekt Red "
-    "concept artists, visible painterly brush strokes, rich textures, stylized dark fantasy, Slavic folklore "
-    "atmosphere, dramatic rim lighting, cinematic composition. "
+    "GWENT: The Witcher Card Game premium card art. Semi-realistic dark fantasy concept art painting, "
+    "traditional oil painting look with thick visible brush strokes and painted texture, gritty and weathered, "
+    "realistic adult anatomy and proportions, mature rugged face with pores, scars and stubble where fitting, "
+    "natural eyes of normal size, muted earthy desaturated colors, dramatic chiaroscuro lighting with strong rim light, "
+    "Slavic medieval folklore atmosphere, epic cinematic composition like a Witcher 3 key art. "
 )
 ART_SCENE = (
     "Waist-up portrait, the character in the lower two thirds, face clearly visible and lit, room above the head. "
-    "A fully painted detailed environment behind the character fills the whole image, atmospheric depth, "
-    "no plain or empty backdrop."
+    "A fully painted richly detailed environment behind the character fills the whole image with depth, "
+    "foreground and background elements, atmospheric perspective, no plain or empty backdrop. "
+    # Отрицательный промпт при true_cfg=1 моделью игнорируется, поэтому запреты — прямо в описании.
+    "Not anime, not manga, not cartoon, not cel-shaded, no glossy airbrushed skin, no big shiny eyes."
 )
 ART_NEGATIVE = (
-    "photorealistic, photograph, photo, hyperrealistic, 3d render, cgi, smooth plastic skin, modern clothing, "
+    "anime, manga, cartoon, cel shading, chibi, big eyes, doll face, glossy airbrushed skin, "
+    "photograph, 3d render, cgi, modern clothing, "
     "plain background, studio backdrop, white background, empty background, gradient background, "
     "text, letters, watermark, card frame, border, ui"
 )
 
 
-def build_art_prompt(data: dict) -> str:
+def build_art_prompt(data: dict, role: Optional[str]) -> str:
     faction = FACTIONS.get(data.get("faction_key")) or FACTION_BY_NAME.get(data.get("faction"), FACTIONS["Neutral"])
-    role = ask_gemini(
-        "Translate this fantasy character class into English, 1-4 words, reply with the translation only: "
-        + data.get("category", ""),
-        temperature=0.2,
-    )
     who = f"The character is a {role}, " if role and len(role) <= 60 else "The character is "
     # Фон — раньше остального: модель читает начало промпта внимательнее.
     return (
-        f"{ART_STYLE}Background: {random.choice(faction.backgrounds)}. "
+        f"{ART_STYLE}Background: {random.choice(faction.backgrounds)}, {random.choice(ART_MOODS)}. "
         f"{who}{faction.attire}, {random.choice(ART_POSES)}. {faction.palette} {ART_SCENE}"
     )
 
 
-def status_ticker(chat_id: int, message_id: int, stop: threading.Event):
+def status_ticker(chat_id: int, status, stop: threading.Event):
     """Раз в 10–15 секунд меняет фразу ожидания, чтобы было видно, что Лавк не завис."""
     last = None
     while not stop.wait(random.uniform(*WAIT_TICK)):
         phrase = random.choice([p for p in LAVK_WAIT_PHRASES if p != last])
         last = phrase
-        safe_call(bot.edit_message_text, phrase + WAIT_INTRO, chat_id, message_id)
+        edit_screen(chat_id, status, phrase + WAIT_INTRO)
 
 
-def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[int], None]):
+def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[object], None]):
     """Общая обвязка: статус, возврат звёзд при ошибке, снятие флага занятости.
 
     mode: paid — списаны звёзды, free — безлимит/админ, trial — пробная картища.
     """
-    status_msg = bot.send_message(chat_id, random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO)
     stop = threading.Event()
-    threading.Thread(target=status_ticker, args=(chat_id, status_msg.message_id, stop), daemon=True).start()
+    status = None
     try:
-        job(status_msg.message_id)
-    except FalError as e:
+        status = send_screen(chat_id, "wait", random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO)
+        threading.Thread(target=status_ticker, args=(chat_id, status, stop), daemon=True).start()
+        job(status)
+    except Exception as e:
         stop.set()
+        if isinstance(e, FalError):
+            text = f"⚠️ Духи не смогли нарисовать: {esc(e)}"
+        else:
+            # Текст исключения пользователю не показываем: в URL Telegram-файлов содержится токен бота.
+            logger.exception("Ошибка генерации для %s", chat_id)
+            text = "⚠️ Системная ошибка связи."
         note = refund(chat_id, price, mode)
-        safe_call(bot.edit_message_text, f"⚠️ Духи не смогли нарисовать: {esc(e)}{note}", chat_id, status_msg.message_id)
-        bot.send_message(chat_id, "Попробуй ещё раз чуть позже.", reply_markup=get_main_menu(chat_id))
-    except Exception:
-        stop.set()
-        # Текст исключения пользователю не показываем: в URL Telegram-файлов содержится токен бота.
-        logger.exception("Ошибка генерации для %s", chat_id)
-        note = refund(chat_id, price, mode)
-        safe_call(bot.edit_message_text, f"⚠️ Системная ошибка связи. Попробуй ещё раз.{note}", chat_id, status_msg.message_id)
-        bot.send_message(chat_id, "Лавк ждёт тебя в меню.", reply_markup=get_main_menu(chat_id))
+        if status is not None:
+            safe_call(bot.delete_message, chat_id, status.message_id)
+        safe_call(send_screen, chat_id, "error", f"{text}{note}\n\nПопробуй ещё раз чуть позже, человече.",
+                  reply_markup=get_main_menu(chat_id))
     finally:
         stop.set()
         busy_users.discard(chat_id)
@@ -1560,79 +1895,99 @@ def load_art(card: dict) -> bytes:
     return download_telegram_file(card.get("art_file_id") or card["file_id"])
 
 
-def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status_id: int,
+def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                  parent_id: Optional[int] = None) -> int:
     """Собирает карту поверх арта, отправляет полную карту + карту в рамке и сохраняет в колоду."""
     trial = bool(card_data.get("trial"))
     full, card_only = render_card(art, card_data, trial=trial)
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
-    sent = bot.send_media_group(chat_id, [
+    sent = tg_retry(bot.send_media_group, chat_id, [
         types.InputMediaPhoto(full, caption=caption, parse_mode="HTML"),
         types.InputMediaPhoto(card_only),
     ])
-    safe_call(bot.delete_message, chat_id, status_id)
+    safe_call(bot.delete_message, chat_id, status.message_id)
     card_id = db.add_card(chat_id, card_data, sent[0].photo[-1].file_id, parent_id=parent_id)
     save_art(card_id, art)
-    if trial:
-        note = ("🎁 <b>Это пробная картища</b> — поэтому на ней водяные знаки Лавка.\n"
-                f"Чистая картища без надписей — {GENERATION_PRICE}⭐. Пополни мешочек и закажи настоящую!")
-    else:
-        note = ("🃏 Картища легла в твою колоду — ищи её в «Моих картищах».\n"
-                "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
-    # Главное меню — обычной клавиатурой, правка (или пополнение) — кнопкой под отдельным сообщением.
-    bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
-    action = "Пополнить мешочек?" if trial else "Хочешь что-то поправить на арте?"
-    bot.send_message(chat_id, f"✏️ {action}", reply_markup=card_markup({"id": card_id, "data": card_data}))
+    try:
+        if trial:
+            note = ("🎁 <b>Это пробная картища</b> — поэтому на ней водяные знаки Лавка.\n"
+                    f"Чистая картища без надписей — {GENERATION_PRICE}⭐. Пополни мешочек и закажи настоящую!")
+        else:
+            note = ("🃏 Картища легла в твою колоду — ищи её в «Моих картищах».\n"
+                    "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
+        # Главное меню — обычной клавиатурой, правка (или пополнение) — кнопкой под отдельным сообщением.
+        bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
+        action = "Пополнить мешочек?" if trial else "Хочешь поменять фон или что-то поправить на арте?"
+        bot.send_message(chat_id, f"✏️ {action}", reply_markup=card_markup({"id": card_id, "data": card_data}))
+    except Exception:
+        # Карта уже доставлена и сохранена — сбой подсказки не должен вызывать возврат звёзд.
+        logger.exception("Не удалось отправить подсказку после карты %s", card_id)
     return card_id
 
 
+def translate_role(category: str) -> Optional[str]:
+    return ask_gemini(
+        "Translate this fantasy character class into English, 1-4 words, reply with the translation only: " + category,
+        temperature=0.2,
+    )
+
+
 def generate_card(chat_id: int, data: dict, mode: str):
-    def job(status_id: int):
-        image = download_telegram_file(data["photo_id"])
-        art = request_fal_image(FAL_GENERATE_ENDPOINT, {
-            "prompt": build_art_prompt(data),
+    def job(status):
+        reference = to_data_uri(download_telegram_file(data["photo_id"]), data["photo_mime"])
+        role = translate_role(data.get("category", ""))
+        art = fal_with_retry(FAL_GENERATE_ENDPOINT, lambda: {
+            "prompt": build_art_prompt(data, role),
             "negative_prompt": ART_NEGATIVE,
-            "reference_image_url": to_data_uri(image, data["photo_mime"]),
+            "reference_image_url": reference,
             "image_size": "portrait_4_3",
             "num_inference_steps": 28,
-            "guidance_scale": 4.0,
+            # Ниже guidance — меньше «глянца», мазки живее.
+            "guidance_scale": 3.5,
             "true_cfg": 1.0,
-            "id_weight": 0.85,
-            # Позже подмешиваем лицо — больше свободы рисованному стилю; 0 давал почти фото.
-            "start_step": 2,
+            "id_weight": 0.8,
+            # Лицо подмешивается позже — у модели больше свободы на рисованный стиль (ценой части сходства).
+            "start_step": 4,
             # По умолчанию промпт обрезается до 128 токенов, и описание фона терялось.
             "max_sequence_length": "512",
+            "seed": random.randint(1, 2 ** 31 - 1),
         })
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
         if mode == "trial":
             card_data["trial"] = True
         title = "🎁 <b>ПРОБНАЯ КАРТИЩА ГОТОВА!</b>" if mode == "trial" else "🔥 <b>ТВОЯ ИСТИННАЯ КАРТИЩА ГОТОВА!</b>"
-        deliver_card(chat_id, art, card_data, title, status_id)
+        deliver_card(chat_id, art, card_data, title, status)
         if mode == "paid":
             award_referrer(chat_id)
 
     run_art_job(chat_id, GENERATION_PRICE, mode, job)
 
 
-def edit_card(chat_id: int, card: dict, instruction: str, mode: str):
-    def job(status_id: int):
-        image = load_art(card)
-        english = ask_gemini(
-            "Translate this image edit request into one short English instruction for an image editing model. "
-            "Reply with the instruction only.\n\n" + instruction,
-            temperature=0.2,
-        ) or instruction
-        art = request_fal_image(FAL_EDIT_ENDPOINT, {
-            "prompt": f"{english}. Keep the person's face, identity and the hand-painted Gwent card art style unchanged.",
-            "image_url": to_data_uri(image, "image/jpeg"),
+EDIT_REWRITE = (
+    "You write instructions for the FLUX Kontext image editing model. Turn the user's request (it may be in Russian) "
+    "into one clear English instruction. If the request is about the background, scenery, place, weather or time "
+    "of day, start with 'Replace the entire background with' and describe the new scene vividly in 2-3 sentences, "
+    "then add 'Keep the character, face, pose and clothing exactly the same.' Otherwise describe precisely what to "
+    "change and what must stay the same. Keep the dark fantasy Witcher setting. Reply with the instruction only.\n\n"
+    "Request: "
+)
+
+
+def edit_card(chat_id: int, card: dict, instruction: str, mode: str, english: Optional[str] = None):
+    def job(status):
+        image = to_data_uri(load_art(card), "image/jpeg")
+        prompt = english or ask_gemini(EDIT_REWRITE + instruction, temperature=0.4) or instruction
+        art = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
+            "prompt": f"{prompt} Same person and same face. Hand-painted GWENT card art style, painterly brush strokes.",
+            "image_url": image,
             "aspect_ratio": "3:4",
-            "guidance_scale": 3.5,
+            "guidance_scale": 4.0,
             "output_format": "jpeg",
         })
         card_data = dict(card["data"], edit=instruction)
         card_data.pop("trial", None)
-        deliver_card(chat_id, art, card_data, "✏️ <b>ПРАВКА ГОТОВА!</b>", status_id, parent_id=card["id"])
+        deliver_card(chat_id, art, card_data, "✏️ <b>ПРАВКА ГОТОВА!</b>", status, parent_id=card["id"])
 
     run_art_job(chat_id, EDIT_PRICE, mode, job)
 
@@ -1648,7 +2003,79 @@ def admin_panel_markup():
     )
     markup.add(types.InlineKeyboardButton("🔎 Найти бойца", callback_data="adm:find"),
                types.InlineKeyboardButton("🎟 Промокоды", callback_data="adm:promo"))
+    markup.add(types.InlineKeyboardButton("🎨 Картинки Лавка", callback_data="adm:scenes"))
     return markup
+
+
+_scene_job = threading.Lock()
+
+
+def show_scenes(chat_id: int):
+    ready = [key for key in SCENES if os.path.exists(scene_path(key))]
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(types.InlineKeyboardButton(f"✨ Нарисовать недостающие ({len(SCENES) - len(ready)})",
+                                          callback_data="adm:scenesmissing"))
+    markup.add(types.InlineKeyboardButton("🔁 Перерисовать все", callback_data="adm:scenesall"))
+    markup.add(*[
+        types.InlineKeyboardButton(("✅ " if key in ready else "▫️ ") + title, callback_data=f"adm:scene:{key}")
+        for key, (title, _) in SCENES.items()
+    ])
+    sample = "есть ✅" if os.path.exists(WELCOME_IMAGE) else f"❌ нет — загрузи {os.path.basename(WELCOME_IMAGE)} рядом с main.py"
+    bot.send_message(
+        chat_id,
+        "🎨 <b>Картинки Лавка на экранах</b>\n\n"
+        f"Готово: <b>{len(ready)}/{len(SCENES)}</b>. Пока картинки нет, на экране — приветственная.\n"
+        f"Образец внешности Лавка (приветственная картинка): {sample}\n\n"
+        "<i>Рисование одной картинки — ~15–30 с и примерно $0.04 на Fal. Нажми на экран, чтобы посмотреть, "
+        "перерисовать или заменить своей картинкой.</i>",
+        reply_markup=markup,
+    )
+
+
+def scene_actions(key: str):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🔄 Перерисовать", callback_data=f"adm:scenegen:{key}"),
+        types.InlineKeyboardButton("📤 Заменить своей", callback_data=f"adm:sceneup:{key}"),
+    )
+    markup.add(types.InlineKeyboardButton("◀️ Ко всем картинкам", callback_data="adm:scenes"))
+    return markup
+
+
+def run_scene_job(admin_id: int, keys: list[str]):
+    if not _scene_job.acquire(blocking=False):
+        bot.send_message(admin_id, "⏳ Лавк уже рисует картинки — дождись окончания.")
+        return
+    try:
+        bot.send_message(admin_id, f"🎨 Рисую картинок: {len(keys)}. Это займёт пару минут…")
+        failed = []
+
+        def one(key):
+            try:
+                draw_scene(key)
+            except Exception as e:
+                logger.exception("Не удалось нарисовать картинку %s", key)
+                failed.append(f"{SCENES[key][0]} ({e})")
+
+        workers = [threading.Thread(target=one, args=(k,)) for k in keys]
+        # По 4 одновременно — быстрее, но без перегрузки очереди Fal.
+        for i in range(0, len(workers), 4):
+            batch = workers[i:i + 4]
+            for w in batch:
+                w.start()
+            for w in batch:
+                w.join()
+        text = f"✅ Готово: {len(keys) - len(failed)} из {len(keys)}."
+        if failed:
+            text += "\n⚠️ Не вышло: " + esc("; ".join(failed))
+        bot.send_message(admin_id, text)
+        if len(keys) == 1 and not failed:
+            send_screen(admin_id, keys[0], f"🖼 <b>{SCENES[keys[0]][0]}</b> — так выглядит теперь.",
+                        reply_markup=scene_actions(keys[0]))
+        else:
+            show_scenes(admin_id)
+    finally:
+        _scene_job.release()
 
 
 PROMO_RE = re.compile(r"^[A-ZА-ЯЁ0-9_-]{3,32}$")
@@ -1673,7 +2100,8 @@ def show_promos(chat_id: int):
 
 
 def show_admin_panel(chat_id: int):
-    bot.send_message(chat_id, "👑 <b>Трон смотрителя пещеры</b>\n\nЧто делаем, господин?", reply_markup=admin_panel_markup())
+    send_screen(chat_id, "admin", "👑 <b>Трон смотрителя пещеры</b>\n\nЧто делаем, господин?",
+                reply_markup=admin_panel_markup())
 
 
 def admin_user_view(user_id: int):
@@ -1770,6 +2198,29 @@ def cb_admin(call):
         bot.send_message(chat_id, "🔎 Пришли ID или @username бойца.", reply_markup=get_cancel_menu())
     elif action == "promo":
         show_promos(chat_id)
+    elif action == "scenes":
+        show_scenes(chat_id)
+    elif action in ("scenesmissing", "scenesall"):
+        keys = [k for k in SCENES if action == "scenesall" or not os.path.exists(scene_path(k))]
+        if not keys:
+            bot.send_message(chat_id, "✅ Все картинки уже нарисованы.")
+            return
+        threading.Thread(target=run_scene_job, args=(chat_id, keys), daemon=True).start()
+    elif action in ("scene", "scenegen", "sceneup") and len(parts) == 3 and parts[2] in SCENES:
+        key = parts[2]
+        if action == "scene":
+            title = SCENES[key][0]
+            if os.path.exists(scene_path(key)):
+                send_screen(chat_id, key, f"🖼 <b>{title}</b>", reply_markup=scene_actions(key))
+            else:
+                bot.send_message(chat_id, f"🖼 <b>{title}</b> — ещё не нарисована.", reply_markup=scene_actions(key))
+        elif action == "scenegen":
+            threading.Thread(target=run_scene_job, args=(chat_id, [key]), daemon=True).start()
+        else:
+            user_states[chat_id] = STATE_ADMIN_SCENE
+            user_data[chat_id] = {"scene_key": key}
+            bot.send_message(chat_id, f"📤 Пришли картинку для экрана «{SCENES[key][0]}» — фото или файлом.",
+                             reply_markup=get_cancel_menu())
     elif action == "promonew":
         user_states[chat_id] = STATE_ADMIN_PROMO
         bot.send_message(
@@ -1897,6 +2348,31 @@ def admin_promo(message):
     show_promos(chat_id)
 
 
+@bot.message_handler(content_types=["photo", "document", "text"],
+                     func=lambda msg: user_states.get(msg.chat.id) == STATE_ADMIN_SCENE and is_admin(msg.from_user.id))
+def admin_scene_upload(message):
+    chat_id = message.chat.id
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+    else:
+        bot.send_message(chat_id, "⚠️ Нужна картинка. Пришли фото или жми «Отмена».")
+        return
+    key = user_data[chat_id]["scene_key"]
+    try:
+        with Image.open(io.BytesIO(download_telegram_file(file_id))) as img:
+            os.makedirs(SCENE_DIR, exist_ok=True)
+            img.convert("RGB").save(scene_path(key), "JPEG", quality=92)
+    except Exception:
+        logger.exception("Не удалось сохранить картинку экрана %s", key)
+        bot.send_message(chat_id, "⚠️ Не получилось прочитать картинку. Попробуй другую.")
+        return
+    reset_user(chat_id)
+    bot.send_message(chat_id, "✅ Сохранил!", reply_markup=get_main_menu(chat_id))
+    send_screen(chat_id, key, f"🖼 <b>{SCENES[key][0]}</b> — так выглядит теперь.", reply_markup=scene_actions(key))
+
+
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == STATE_PROMO)
 def process_promo(message):
     chat_id = message.chat.id
@@ -1911,7 +2387,7 @@ def process_promo(message):
         "used": "😏 Этот промокод ты уже активировал, человече. Второй раз не прокатит!",
         "exhausted": "😢 Опоздал — этот промокод уже разобрали.",
     }[status]
-    bot.send_message(chat_id, text, reply_markup=get_main_menu(chat_id))
+    send_screen(chat_id, "pouch" if status == "ok" else "promo", text, reply_markup=get_main_menu(chat_id))
 
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == STATE_TOPUP_AMOUNT)
@@ -1949,13 +2425,15 @@ def fallback_handler(message):
         bot.send_message(chat_id, "👆 Выбери вариант кнопкой выше, человече.")
     elif state == STATE_PHOTO:
         bot.send_message(chat_id, "⚠️ Лавк просил картинку! Пришли фото, человече.")
+    elif state == STATE_ADMIN_SCENE:
+        bot.send_message(chat_id, "⚠️ Нужна картинка. Пришли фото или жми «Отмена».")
     elif state in STEPS or state in (STATE_EDIT_PROMPT, STATE_TOPUP_AMOUNT, STATE_PROMO, STATE_ADMIN_PROMO):
         bot.send_message(chat_id, "⚠️ Лавк ждёт текст!")
     elif chat_id in busy_users:
         bot.send_message(chat_id, "⏳ Лавк рисует, подожди чуть-чуть!")
     else:
-        bot.send_message(chat_id, "Ууу, Лавк не понял. Жми кнопки в меню, человече!",
-                         reply_markup=get_main_menu(chat_id))
+        send_screen(chat_id, "confused", "Ууу, Лавк не понял. Жми кнопки в меню, человече!",
+                    reply_markup=get_main_menu(chat_id))
 
 
 if __name__ == "__main__":
