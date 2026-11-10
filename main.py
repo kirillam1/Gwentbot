@@ -1,6 +1,7 @@
 import base64
 import html
 import io
+import json
 import logging
 import os
 import random
@@ -14,7 +15,8 @@ from urllib.parse import quote
 
 import requests
 import telebot
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
 from google import genai
 from google.genai import types as genai_types
 from telebot import apihelper, types
@@ -45,6 +47,7 @@ WELCOME_IMAGE = os.path.join(BASE_DIR, "1794190872103.jpg")
 
 FAL_GENERATE_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pulid"
 FAL_EDIT_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/kontext"
+FAL_MASK_ENDPOINT = "https://queue.fal.run/fal-ai/birefnet/v2"
 FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
 GEMINI_TIMEOUT_MS = 30_000
 
@@ -101,7 +104,6 @@ class Faction:
     button: str
     name: str
     about: str               # описание в меню выбора
-    attire: str              # внешний вид персонажа для арта
     backgrounds: tuple       # фоны в духе фракции, выбираются случайно
     palette: str
     mechanics: str           # ключевые слова способностей этой фракции (для Gemini)
@@ -116,8 +118,6 @@ FACTIONS = {
     "Nilfgaard": Faction(
         "🛡 Нильфгаард", "Нильфгаард",
         "Империя Белого Пламени: железная дисциплина, шпионы и придворные интриги. Чёрное с золотом.",
-        "wearing ornate black enamelled Nilfgaardian plate armor with gold filigree and a golden sun emblem on the chest, "
-        "a heavy black cloak with a high collar, stern disciplined aristocratic look",
         (
             "a vast Nilfgaardian war camp, black and gold pavilions, campfires, rows of pikemen and imperial sun banners",
             "the marble throne hall of the imperial palace in the City of Golden Towers, golden sun mosaics, tall columns and braziers",
@@ -146,8 +146,6 @@ FACTIONS = {
     "Monsters": Faction(
         "👾 Чудовища", "Чудовища",
         "Твари из болот, пещер и туманов: голод, когти, древние проклятия и Дикая Охота.",
-        "a terrifying monstrous being with pale veined skin, feral glowing eyes and bestial features, wearing grim armor "
-        "of bone, chitin and rotten leather adorned with skulls and claws",
         (
             "a foggy swamp at midnight, twisted dead trees like claws, glowing eyes hidden in green mist, bubbling black water",
             "a dark cave lair littered with bones and gnawed armor, dripping stalactites, a faint sickly green glow",
@@ -176,8 +174,6 @@ FACTIONS = {
     "Skellige": Faction(
         "⚓ Скеллиге", "Скеллиге",
         "Островные кланы: берсерки, драккары, штормы и честь, добытая в бою.",
-        "a rugged Skellige island warrior with braided hair and war paint, wearing bear-fur mantles, chainmail, "
-        "leather and clan armor carved with Celtic knots and runes, an axe or a round shield",
         (
             "a stormy northern coast, huge waves crashing against black cliffs, a dragon-headed longship in the surf",
             "a snowy mountain village of carved wooden longhouses, a roaring bonfire, clan banners and chimney smoke",
@@ -206,8 +202,6 @@ FACTIONS = {
     "Northern": Faction(
         "⚜️ Королевства Севера", "Королевства Севера",
         "Короли и рыцари Темерии, Редании и Каэдвена: сталь, знамёна и осадные машины.",
-        "a noble Northern knight in polished steel plate armor with a blue and silver heraldic tabard, "
-        "a long sword and a kite shield with a royal coat of arms",
         (
             "the war-torn courtyard of a besieged stone castle, trebuchets, arrows in the sky, blue and silver royal banners",
             "a royal throne hall lit by candles and stained-glass windows, heraldic tapestries and banners",
@@ -237,8 +231,6 @@ FACTIONS = {
     "Syndicate": Faction(
         "💰 Синдикат", "Синдикат",
         "Преступный мир Новиграда: монеты, долги, наёмные ножи и награды за головы.",
-        "a cunning Novigrad criminal in a lavish but frayed velvet coat, gold rings and chains, a hidden dagger, "
-        "a shady conspiratorial smirk",
         (
             "a narrow Novigrad alley at night, wet cobblestones reflecting orange lanterns, rain, shadowy figures in doorways",
             "a smoky gambling den lit by candles, tables piled with gold coins, dice and cards, thugs watching from the shadows",
@@ -267,8 +259,6 @@ FACTIONS = {
     "Scoiatael": Faction(
         "🐿 Скоя'таэли", "Скоя'таэли",
         "Эльфы, краснолюды и дриады-партизаны: лесные засады, луки и древняя магия.",
-        "an elven guerilla fighter with sharp features and pointed ears, wearing forest camouflage, green and brown "
-        "leather armor decorated with leaves and feathers, a longbow or twin blades",
         (
             "an ancient magical forest, colossal mossy oaks, crumbling white marble elven ruins, shafts of golden light",
             "a forest road in autumn, an ambush among red and orange trees, arrows flying, falling leaves",
@@ -298,8 +288,6 @@ FACTIONS = {
     "Neutral": Faction(
         "🐺 Нейтральная", "Нейтральная",
         "Ведьмаки, чародеи, наёмники и бродяги — без знамени и без хозяина.",
-        "a hardened witcher-like wanderer with scars, wearing worn dark leather armor with steel studs, a silver medallion "
-        "and the hilts of two swords over the shoulder",
         (
             "a dim medieval tavern, heavy oak tables, candles, ale barrels and blurry patrons in the background",
             "a misty crossroads with an old signpost, a gallows and a dark forest behind",
@@ -327,6 +315,79 @@ FACTIONS = {
     ),
 }
 FACTION_BY_NAME = {f.name: f for f in FACTIONS.values()}
+
+# Внешность персонажа для арта: (мужские варианты, женские варианты), выбирается случайно.
+ATTIRE = {
+    "Nilfgaard": (
+        ("an imperial Nilfgaardian officer in ornate black enamelled plate armor with gold filigree, a golden sun "
+         "emblem on the breastplate and a heavy black cloak with a high collar",
+         "a Nilfgaardian imperial spy in a tailored black-and-gold silk doublet, black leather gloves and a thin rapier",
+         "an imperial battle mage in long black robes embroidered with golden suns, holding a staff with a glowing crystal"),
+        ("a female imperial officer in fitted black enamelled plate armor with gold filigree, a golden sun emblem "
+         "and a black cloak with a high collar",
+         "a Nilfgaardian noblewoman in an elegant high-collared black-and-gold gown with a golden sun brooch",
+         "an imperial sorceress in flowing black robes embroidered with golden suns, a glowing crystal in her hand"),
+    ),
+    "Monsters": (
+        ("a terrifying monstrous being with pale veined skin, feral glowing eyes and bestial features, wearing grim "
+         "armor of bone, chitin and rotten leather adorned with skulls",
+         "a Wild Hunt warrior in spiked black frost-covered armor with a skull-like helmet held under the arm",
+         "an ancient vampire lord with deathly pale skin, red eyes and fangs, in a tattered dark velvet coat"),
+        ("a vampire noblewoman with deathly pale skin, red eyes and fangs, in a tattered dark crimson gown",
+         "a swamp witch with bark-like skin, wild hair tangled with twigs and bones, wrapped in rotten rags and charms",
+         "a ghostly noonwraith woman in a torn white dress, pale glowing skin and hollow burning eyes"),
+    ),
+    "Skellige": (
+        ("a rugged Skellige island warrior with braided hair and war paint, wearing bear-fur mantles, chainmail and "
+         "leather armor carved with Celtic knots and runes, holding an axe",
+         "a Skellige raider with a shaved head and runic tattoos, a wolf pelt over the shoulders and a round wooden shield",
+         "a Skellige druid in rough grey robes with a staff of driftwood, bone amulets and braided beard"),
+        ("a fierce Skellige shieldmaiden with long braided hair and war paint, a fur mantle, chainmail and a round "
+         "painted shield, an axe in her hand",
+         "a Skellige priestess of Freya in white and blue robes with a silver torc and a crown of feathers",
+         "a Skellige huntress in furs and leather with a longbow, runic tattoos on her arms and wind-blown braids"),
+    ),
+    "Northern": (
+        ("a noble Northern knight in polished steel plate armor with a blue and silver heraldic tabard, a long sword "
+         "and a kite shield with a royal coat of arms",
+         "a Northern king in a golden crown, an ermine-trimmed royal blue mantle over gilded armor",
+         "a Temerian Blue Stripes commando in a padded gambeson, chainmail, a blue striped tabard and a crossbow"),
+        ("a female Northern knight in fitted polished plate armor with a blue and silver heraldic tabard, a long sword "
+         "and a kite shield",
+         "a Northern queen in a jewelled crown and an ermine-trimmed royal blue gown",
+         "a Northern sorceress in an elegant blue and silver dress with a lily brooch, magic glowing at her fingertips"),
+    ),
+    "Syndicate": (
+        ("a Novigrad street thug in a patched leather jerkin over a dirty linen shirt, a hood, crude tattoos and knife "
+         "scars, brass knuckles and daggers tucked into his belt, cheap tarnished rings",
+         "a sly smuggler in a long weathered greatcoat, a battered tricorn hat, a pistol-crossbow and pouches of contraband",
+         "a twitchy fisstech addict with sunken bloodshot eyes, ragged layered clothes, a grimy scarf and a stolen purse"),
+        ("a Novigrad courtesan in a laced corset dress with a loose silk shawl, kohl-lined eyes, red lips, cheap pearls "
+         "and a hidden stiletto in her sleeve",
+         "a female cutpurse in a short hooded cloak and a fitted leather bodice, lockpicks and throwing knives on her belt",
+         "a tough female gang leader with an eyepatch, a man's long coat over a ruffled shirt and gold teeth"),
+    ),
+    "Scoiatael": (
+        ("an elven guerilla fighter with sharp features and pointed ears, forest camouflage, green and brown leather "
+         "armor decorated with leaves and feathers, a longbow",
+         "a stocky dwarven warrior with a long braided beard, heavy riveted armor and a great war hammer",
+         "an elven commander with a squirrel-tail pin, a green hood, twin curved blades and a scarred face"),
+        ("an elven huntress with sharp features and pointed ears, green and brown leather armor decorated with leaves "
+         "and feathers, a longbow drawn",
+         "a dryad of Brokilon with bark-like tattoos on her skin, leaves woven in her hair and a living-wood bow",
+         "an elven sorceress in a flowing pale green gown with silver leaf jewellery, pointed ears and glowing hands"),
+    ),
+    "Neutral": (
+        ("a hardened witcher with scars and cat-like eyes, worn dark leather armor with steel studs, a silver wolf "
+         "medallion and two swords over the shoulder",
+         "a grizzled mercenary in mismatched plate and chainmail, a battered helmet under the arm and a broadsword",
+         "a wandering bard in a feathered hat and a colorful slashed doublet, holding a lute"),
+        ("a female witcher with scars and cat-like eyes, fitted dark leather armor, a silver medallion and two swords "
+         "over the shoulder",
+         "a powerful sorceress in an elegant black and white dress with an obsidian star necklace, magic swirling around",
+         "a female mercenary in worn leather and chainmail with a crossbow and a scarred, determined face"),
+    ),
+}
 
 ART_POSES = (
     "standing in a three-quarter view, one hand resting on the pommel of a sheathed sword",
@@ -1559,30 +1620,25 @@ def cb_deck(call):
         "• «пусть за спиной горит деревня»\n"
         "• «добавь шрам на щеку и капюшон»\n"
         "• «дай в руки огненный меч»</i>\n\n"
-        "Или выбери готовую правку кнопкой. Лицо духи сохранят.",
+        "Или выбери готовую правку кнопкой. При смене фона герой остаётся в точности как был, "
+        "а лицо духи меняют, только если ты сам об этом попросишь.",
         reply_markup=quick,
     )
 
 
-# Готовые правки: (кнопка, инструкция для модели; {bg} — случайный фон фракции картищи)
+# Готовые правки — все меняют только фон, герой остаётся пиксель в пиксель. {bg} — случайный фон фракции.
 EDIT_QUICK = {
-    "bg": ("🌄 Новый фон в духе фракции",
-           "Replace the entire background with {bg}. Keep the character, face, pose and clothing exactly the same."),
+    "bg": ("🌄 Новый фон в духе фракции", "{bg}."),
     "night": ("🌙 Ночная сцена при луне",
-              "Change the scene to a moonlit night: dark blue sky with a full moon, cold moonlight rim light on the "
-              "character, deep shadows. Keep the character, face, pose and clothing exactly the same."),
-    "storm": ("⛈ Буря и молнии",
-              "Replace the background with a raging storm: black clouds, lightning, driving rain and wind. "
-              "Keep the character, face, pose and clothing exactly the same."),
-    "fire": ("🔥 Пожар и искры",
-             "Replace the background with a burning battlefield: flames, smoke and flying embers lighting the scene "
-             "with orange light. Keep the character, face, pose and clothing exactly the same."),
+              "The same kind of place at night under a full moon, dark blue sky, cold moonlight and deep shadows."),
+    "storm": ("⛈ Буря и молнии", "A raging storm: black clouds, forks of lightning, driving rain and wind."),
+    "fire": ("🔥 Пожар и искры", "A burning battlefield: flames, smoke and flying embers glowing orange."),
 }
 
 
-def ask_edit_confirm(chat_id: int, text: str, english: Optional[str] = None):
+def ask_edit_confirm(chat_id: int, text: str, preset: Optional[tuple] = None):
     user_data[chat_id]["edit_prompt"] = text
-    user_data[chat_id]["edit_english"] = english
+    user_data[chat_id]["edit_preset"] = preset
     user_states[chat_id] = STATE_EDIT_CONFIRM
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1609,9 +1665,9 @@ def cb_edit_quick(call):
         reset_user(chat_id)
         return
     faction = FACTION_BY_NAME.get(card["data"].get("faction"), FACTIONS["Neutral"])
-    label, english = EDIT_QUICK[key]
+    label, scene = EDIT_QUICK[key]
     safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
-    ask_edit_confirm(chat_id, label, english.format(bg=random.choice(faction.backgrounds)))
+    ask_edit_confirm(chat_id, label, ("background", scene.format(bg=random.choice(faction.backgrounds))))
 
 
 @bot.message_handler(func=lambda msg: user_states.get(msg.chat.id) == STATE_EDIT_PROMPT)
@@ -1654,12 +1710,12 @@ def cb_edit_confirm(call):
         return
     safe_call(bot.answer_callback_query, call.id)
     instruction = user_data[chat_id]["edit_prompt"]
-    english = user_data[chat_id].get("edit_english")
+    preset = user_data[chat_id].get("edit_preset")
     reset_user(chat_id)
     busy_users.add(chat_id)
     safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
     bot.send_message(chat_id, f"✅ <b>Правка принята:</b> {esc(instruction)}", reply_markup=get_main_menu(chat_id))
-    threading.Thread(target=edit_card, args=(chat_id, card, instruction, "paid" if paid else "free", english),
+    threading.Thread(target=edit_card, args=(chat_id, card, instruction, "paid" if paid else "free", preset),
                      daemon=True).start()
 
 
@@ -1705,7 +1761,7 @@ def is_blank(image: bytes) -> bool:
         return True
 
 
-def request_fal_image(endpoint: str, payload: dict) -> bytes:
+def request_fal_image(endpoint: str, payload: dict, check_blank: bool = True) -> bytes:
     """Генерация через очередь Fal: запрос не висит на одном соединении, есть общий дедлайн."""
     if not FAL_KEY:
         raise FalError("не задан FAL_API_KEY")
@@ -1736,14 +1792,14 @@ def request_fal_image(endpoint: str, payload: dict) -> bytes:
     try:
         result.raise_for_status()
         body = result.json()
-        image_url = body["images"][0]["url"]
+        image_url = fal_image_url(body)
     except (requests.HTTPError, ValueError, KeyError, IndexError, TypeError):
         logger.error("Неожиданный ответ Fal.ai: %s %s", result.status_code, result.text[:1000])
         raise FalError("Fal.ai вернул ответ без картинки", retryable=result.status_code >= 500)
     art = http_retry("GET", image_url, timeout=90)
     if not art.ok:
         raise FalError("не удалось скачать картинку", retryable=True)
-    if any(body.get("has_nsfw_concepts") or []) or is_blank(art.content):
+    if check_blank and (any(body.get("has_nsfw_concepts") or []) or is_blank(art.content)):
         logger.warning("Fal.ai: картинка отфильтрована (%s)", job.get("request_id"))
         raise FalError("духи забраковали рисунок", retryable=True)
     return art.content
@@ -1806,7 +1862,7 @@ def award_referrer(user_id: int):
 ART_STYLE = (
     "GWENT: The Witcher Card Game premium card art. Semi-realistic dark fantasy concept art painting, "
     "traditional oil painting look with thick visible brush strokes and painted texture, gritty and weathered, "
-    "realistic adult anatomy and proportions, mature rugged face with pores, scars and stubble where fitting, "
+    "realistic adult anatomy and proportions, a believable characterful face with natural skin texture, "
     "natural eyes of normal size, muted earthy desaturated colors, dramatic chiaroscuro lighting with strong rim light, "
     "Slavic medieval folklore atmosphere, epic cinematic composition like a Witcher 3 key art. "
 )
@@ -1825,13 +1881,25 @@ ART_NEGATIVE = (
 )
 
 
-def build_art_prompt(data: dict, role: Optional[str]) -> str:
-    faction = FACTIONS.get(data.get("faction_key")) or FACTION_BY_NAME.get(data.get("faction"), FACTIONS["Neutral"])
-    who = f"The character is a {role}, " if role and len(role) <= 60 else "The character is "
+GENDER_TEXT = {
+    "female": ("The character is a woman: female face, feminine body and proportions, slender shoulders, "
+               "womanly figure, no beard. "),
+    "male": "The character is a man with a masculine build. ",
+}
+
+
+def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str]) -> str:
+    key = data.get("faction_key") or next((k for k, f in FACTIONS.items() if f.name == data.get("faction")), "Neutral")
+    faction = FACTIONS.get(key, FACTIONS["Neutral"])
+    male, female = ATTIRE.get(key, ATTIRE["Neutral"])
+    # Без пола — мужской вариант с явным «человек», как было раньше; с женским фото — женская одежда и фигура.
+    attire = random.choice(female if gender == "female" else male)
+    role_text = f" Their trade: {role}." if role and len(role) <= 60 else ""
     # Фон — раньше остального: модель читает начало промпта внимательнее.
     return (
         f"{ART_STYLE}Background: {random.choice(faction.backgrounds)}, {random.choice(ART_MOODS)}. "
-        f"{who}{faction.attire}, {random.choice(ART_POSES)}. {faction.palette} {ART_SCENE}"
+        f"{GENDER_TEXT.get(gender, '')}Portrait of {attire}, {random.choice(ART_POSES)}.{role_text} "
+        f"{faction.palette} {ART_SCENE}"
     )
 
 
@@ -1996,12 +2064,49 @@ def translate_role(category: str) -> Optional[str]:
     )
 
 
+def ask_gemini_vision(image: bytes, prompt: str, as_json: bool = False):
+    """Вопрос Gemini про картинку. None — Gemini недоступен или ответил непонятно."""
+    if gemini_client is None:
+        return None
+    try:
+        config = genai_types.GenerateContentConfig(
+            temperature=0, response_mime_type="application/json" if as_json else None)
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[genai_types.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt],
+            config=config,
+        )
+        text = (response.text or "").strip()
+        return json.loads(text) if as_json else text
+    except Exception:
+        logger.exception("Ошибка Gemini (картинка)")
+        return None
+
+
+def detect_gender(photo: bytes) -> Optional[str]:
+    """Пол человека на фото — иначе модель по «воинскому» промпту рисует мужское тело с женским лицом."""
+    answer = ask_gemini_vision(photo, "Is the main person in this photo a woman or a man? "
+                                      "Reply with exactly one word: female or male.")
+    answer = (answer or "").strip().lower()
+    return answer if answer in ("female", "male") else None
+
+
+def as_jpeg(image: bytes) -> bytes:
+    with Image.open(io.BytesIO(image)) as img:
+        out = io.BytesIO()
+        img.convert("RGB").save(out, "JPEG", quality=92)
+        return out.getvalue()
+
+
 def generate_card(chat_id: int, data: dict, mode: str):
     def job(status):
-        reference = to_data_uri(download_telegram_file(data["photo_id"]), data["photo_mime"])
+        photo = download_telegram_file(data["photo_id"])
+        reference = to_data_uri(photo, data["photo_mime"])
         role = translate_role(data.get("category", ""))
+        gender = detect_gender(as_jpeg(photo))
+        logger.info("Генерация для %s: пол %s", chat_id, gender)
         art = fal_with_retry(FAL_GENERATE_ENDPOINT, lambda: {
-            "prompt": build_art_prompt(data, role),
+            "prompt": build_art_prompt(data, role, gender),
             "negative_prompt": ART_NEGATIVE,
             "reference_image_url": reference,
             "image_size": "portrait_4_3",
@@ -2018,6 +2123,8 @@ def generate_card(chat_id: int, data: dict, mode: str):
         })
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
+        if gender:
+            card_data["gender"] = gender
         if mode == "trial":
             card_data["trial"] = True
         title = "🎁 <b>ПРОБНАЯ КАРТИЩА ГОТОВА!</b>" if mode == "trial" else "🔥 <b>ТВОЯ ИСТИННАЯ КАРТИЩА ГОТОВА!</b>"
@@ -2028,27 +2135,168 @@ def generate_card(chat_id: int, data: dict, mode: str):
     run_art_job(chat_id, GENERATION_PRICE, mode, job)
 
 
-EDIT_REWRITE = (
-    "You write instructions for the FLUX Kontext image editing model. Turn the user's request (it may be in Russian) "
-    "into one clear English instruction. If the request is about the background, scenery, place, weather or time "
-    "of day, start with 'Replace the entire background with' and describe the new scene vividly in 2-3 sentences, "
-    "then add 'Keep the character, face, pose and clothing exactly the same.' Otherwise describe precisely what to "
-    "change and what must stay the same. Keep the dark fantasy Witcher setting. Reply with the instruction only.\n\n"
+# ---------- правки ----------
+# Тип правки решает, как беречь лицо:
+#   background — героя не перерисовываем вовсе: вырезаем по маске и кладём на новый фон;
+#   other      — Kontext правит одежду/оружие/эффекты, потом возвращаем исходное лицо на место;
+#   face       — человек сам просит поменять лицо (шрам, борода…), лицо не восстанавливаем.
+EDIT_CLASSIFY = (
+    "You prepare edits for the FLUX Kontext image editing model on a dark fantasy Witcher-style portrait. "
+    "Classify the user's request (it may be in Russian) and write the English instruction. Reply as JSON: "
+    '{"kind": "background" | "face" | "other", "instruction": "..."}.\n'
+    "- background: the request changes only the place, scenery, weather, sky or time of day. Then instruction is "
+    "a vivid 2-3 sentence description of the new scene ONLY, without the character.\n"
+    "- face: the request changes the face, head or hair (scar, beard, eyes, age, expression, hairstyle, makeup, "
+    "tattoo on the face). Then instruction says precisely what to change on the face and to keep everything else.\n"
+    "- other: everything else (clothes, armor, weapons, objects, pose, magic effects). Then instruction says "
+    "precisely what to change.\n"
     "Request: "
 )
+FACE_WORDS = ("лиц", "шрам", "глаз", "бород", "усы", "усов", "волос", "причёс", "прическ", "нос", "губ", "улыб",
+              "морщин", "макияж", "возраст", "старше", "моложе", "брови", "лыс", "уши", "ухо", "щек", "щёк", "зуб")
+BG_WORDS = ("фон", "задн", "небо", "ночь", "ночн", "днём", "погод", "локац", "пейзаж", "место", "закат", "рассвет",
+            "лес", "горы", "море", "замок", "город", "дождь", "снег", "туман", "пещер", "таверн")
+KEEP_IDENTITY = ("Keep the exact same person: identical facial features, face shape, eyes, nose, mouth, skin tone, "
+                 "hairstyle and expression. Keep the same position, scale, pose and camera framing.")
+EDIT_STYLE = "Hand-painted GWENT card art style, painterly brush strokes."
 
 
-def edit_card(chat_id: int, card: dict, instruction: str, mode: str, english: Optional[str] = None):
+def classify_edit(request: str) -> tuple[str, str]:
+    answer = None
+    if gemini_client is not None:
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL, contents=EDIT_CLASSIFY + request,
+                config=genai_types.GenerateContentConfig(temperature=0.3, response_mime_type="application/json"),
+            )
+            answer = json.loads(response.text or "{}")
+        except Exception:
+            logger.exception("Ошибка Gemini (разбор правки)")
+    if isinstance(answer, dict) and answer.get("kind") in ("background", "face", "other") and answer.get("instruction"):
+        return answer["kind"], str(answer["instruction"])
+    low = request.lower()
+    if any(w in low for w in FACE_WORDS):
+        return "face", request
+    if any(w in low for w in BG_WORDS):
+        return "background", request
+    return "other", request
+
+
+def fal_image_url(body: dict) -> str:
+    return (body.get("images") or [{}])[0].get("url") or body["image"]["url"]
+
+
+def subject_mask(image_uri: str) -> bytes:
+    """Маска персонажа (белое — герой) от BiRefNet."""
+    return request_fal_image(FAL_MASK_ENDPOINT, {
+        "image_url": image_uri, "model": "General Use (Heavy)", "mask_only": True, "output_format": "png",
+    }, check_blank=False)
+
+
+def composite_subject(source: bytes, background: bytes, mask: bytes) -> bytes:
+    """Кладёт исходного героя (пиксель в пиксель) на новый фон, слегка подстраивая общий тон под сцену."""
+    src = Image.open(io.BytesIO(source)).convert("RGB")
+    bg = Image.open(io.BytesIO(background)).convert("RGB").resize(src.size, Image.LANCZOS)
+    m = Image.open(io.BytesIO(mask)).convert("L").resize(src.size, Image.LANCZOS)
+    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(1.5))
+    a, b = np.asarray(src, np.float32), np.asarray(bg, np.float32)
+    alpha = np.asarray(m, np.float32)[..., None] / 255
+    outside = 1 - alpha
+    weight = max(float(outside.sum()), 1.0)
+    old_tone = (a * outside).sum(axis=(0, 1)) / weight
+    new_tone = (b * outside).sum(axis=(0, 1)) / weight
+    # Половина разницы освещения: герой «садится» в сцену, но лицо не меняется.
+    gain = np.clip(new_tone / np.maximum(old_tone, 1), 0.6, 1.4) ** 0.5
+    out = np.clip(a * gain, 0, 255) * alpha + b * outside
+    buf = io.BytesIO()
+    Image.fromarray(out.astype(np.uint8)).save(buf, "JPEG", quality=93)
+    return buf.getvalue()
+
+
+def replace_background(source: bytes, scene: str) -> bytes:
+    uri = to_data_uri(source, "image/jpeg")
+    results: dict = {}
+
+    def mask_job():
+        try:
+            results["mask"] = subject_mask(uri)
+        except Exception as e:
+            results["mask_error"] = e
+
+    worker = threading.Thread(target=mask_job, daemon=True)
+    worker.start()
+    # Kontext рисует сцену без героя — тогда под вклеенной фигурой не остаётся «призрака» старого силуэта.
+    empty = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
+        "prompt": (f"Remove the character completely, leaving only the scene, and change the scene to: {scene} "
+                   f"Keep the same camera angle, perspective and composition. {EDIT_STYLE}"),
+        "image_url": uri, "aspect_ratio": "3:4", "guidance_scale": 3.5, "output_format": "jpeg",
+    })
+    worker.join(timeout=FAL_DEADLINE)
+    if "mask" not in results:
+        # Без маски — запасной путь: обычная правка фона с защитой лица.
+        logger.warning("Маска героя не получена (%r), правлю фон напрямую", results.get("mask_error"))
+        return edit_with_identity(source, f"Change the background to: {scene}", restore=True)
+    return composite_subject(source, empty, results["mask"])
+
+
+def face_box(image: bytes) -> Optional[tuple[int, int, int, int]]:
+    answer = ask_gemini_vision(
+        image, 'Find the face of the main character. Reply as JSON {"box_2d": [ymin, xmin, ymax, xmax]} with '
+               'coordinates normalized to 0-1000, or {"box_2d": null} if there is no face.', as_json=True)
+    try:
+        y0, x0, y1, x1 = [float(v) for v in answer["box_2d"]]
+    except (TypeError, KeyError, ValueError):
+        return None
+    w, h = Image.open(io.BytesIO(image)).size
+    box = (int(x0 * w / 1000), int(y0 * h / 1000), int(x1 * w / 1000), int(y1 * h / 1000))
+    area = (box[2] - box[0]) * (box[3] - box[1]) / (w * h)
+    return box if 0.004 < area < 0.5 else None
+
+
+def restore_face(source: bytes, edited: bytes) -> bytes:
+    """Возвращает исходное лицо поверх правки, если Kontext не сдвинул голову."""
+    box = face_box(source)
+    if box is None:
+        return edited
+    src = Image.open(io.BytesIO(source)).convert("RGB")
+    out = Image.open(io.BytesIO(edited)).convert("RGB").resize(src.size, Image.LANCZOS)
+    a = np.asarray(src.crop(box).convert("L").resize((32, 32)), np.float32).ravel()
+    b = np.asarray(out.crop(box).convert("L").resize((32, 32)), np.float32).ravel()
+    similarity = float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else 0.0
+    if similarity < 0.45:
+        # Голова сдвинулась или повернулась — вклейка дала бы «маску», оставляем как есть.
+        logger.info("Лицо не восстановлено: сходство области %.2f", similarity)
+        return edited
+    x0, y0, x1, y1 = box
+    pad_x, pad_y = (x1 - x0) * 0.06, (y1 - y0) * 0.04
+    mask = Image.new("L", src.size, 0)
+    ImageDraw.Draw(mask).ellipse((x0 + pad_x, y0 + pad_y, x1 - pad_x, y1 - pad_y), fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(max(2, (x1 - x0) * 0.08)))
+    result = Image.composite(src, out, mask)
+    buf = io.BytesIO()
+    result.save(buf, "JPEG", quality=93)
+    return buf.getvalue()
+
+
+def edit_with_identity(source: bytes, instruction: str, restore: bool) -> bytes:
+    uri = to_data_uri(source, "image/jpeg")
+    keep = KEEP_IDENTITY if restore else "Keep everything else, the person's identity and the pose the same."
+    edited = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
+        "prompt": f"{instruction} {keep} {EDIT_STYLE}",
+        "image_url": uri, "aspect_ratio": "3:4", "guidance_scale": 3.5, "output_format": "jpeg",
+    })
+    return restore_face(source, edited) if restore else edited
+
+
+def edit_card(chat_id: int, card: dict, instruction: str, mode: str, preset: Optional[tuple] = None):
     def job(status):
-        image = to_data_uri(load_art(card), "image/jpeg")
-        prompt = english or ask_gemini(EDIT_REWRITE + instruction, temperature=0.4) or instruction
-        art = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
-            "prompt": f"{prompt} Same person and same face. Hand-painted GWENT card art style, painterly brush strokes.",
-            "image_url": image,
-            "aspect_ratio": "3:4",
-            "guidance_scale": 4.0,
-            "output_format": "jpeg",
-        })
+        source = as_jpeg(load_art(card))
+        kind, english = preset or classify_edit(instruction)
+        logger.info("Правка %s для %s: %s", kind, chat_id, english[:200])
+        if kind == "background":
+            art = replace_background(source, english)
+        else:
+            art = edit_with_identity(source, english, restore=(kind == "other"))
         card_data = dict(card["data"], edit=instruction)
         card_data.pop("trial", None)
         deliver_card(chat_id, art, card_data, "✏️ <b>ПРАВКА ГОТОВА!</b>", status, parent_id=card["id"])
