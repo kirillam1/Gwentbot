@@ -1,55 +1,67 @@
-"""Сборка изображения карты в стиле GWENT: арт в рамке + панель с текстом."""
+"""Сборка изображения карты в стиле GWENT поверх шаблона, извлечённого из скриншотов игры.
+
+Шаблоны лежат в assets/card (их собирает tools/build_card_templates.py). Все координаты ниже —
+в системе исходного скриншота 2752×1536; готовая картинка — его обрезка CROP.
+"""
 import io
 import os
 import re
 from functools import lru_cache
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
-FONT_REGULAR = "PT_Sans-Narrow-Web-Regular.ttf"
-FONT_BOLD = "PT_Sans-Narrow-Web-Bold.ttf"
-FONT_ITALIC = "PT_Sans-Web-Italic.ttf"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "assets", "fonts")
+CARD_DIR = os.path.join(BASE_DIR, "assets", "card")
+
+FONT_REGULAR = "RobotoCondensed-Regular.ttf"
+FONT_BOLD = "RobotoCondensed-Bold.ttf"
+FONT_ITALIC = "RobotoCondensed-Italic.ttf"
+FONT_NAME = "Tektur-Variable.ttf@86,580"
+FONT_DIGITS = "TekturCond-Bold.ttf"
 FONT_ICONS = "DejaVuSans.ttf"
 
-CANVAS_W, CANVAS_H = 1600, 900
-CARD_X, CARD_Y, CARD_W, CARD_H = 60, 80, 520, 740
-BORDER = 12
-PANEL_X, PANEL_W = 630, 910
-HEADER_H = 150
-PAD = 44
+# ---------- геометрия шаблона ----------
+CROP = (190, 70, 2562, 1392)
+CARD_ORIGIN = (257, 129)
+ART_WINDOW = (279, 147, 1092, 1306)
+POWER_CENTER, POWER_HEIGHT, POWER_MAX_W = (391, 268), 114, 100
+PROVISION_CENTER, PROVISION_HEIGHT, PROVISION_MAX_W = (1004, 1204), 120, 128
+ARMOR_CENTER = (392, 440)
+HEADER = (1141, 123, 2492, 356)
+NAME_POS, NAME_CAP, NAME_SQUEEZE = (1235, 185), 62, 1.0
+CATEGORY_POS, CATEGORY_SIZE = (1233, 272), 55
+ICON_BOX = (2296, 160, 2490, 352)
+TEXT_LEFT, TEXT_RIGHT = 1224, 2452
+BODY_TOP, BODY_BOTTOM = 396, 1290
 
-# header — цвет плашки с именем, accent — цвет значка фракции.
 FACTION_STYLES = {
-    "Нильфгаард": {"header": (40, 35, 30), "accent": (228, 180, 76), "icon": "☀"},
-    "Чудовища": {"header": (96, 24, 22), "accent": (238, 150, 120), "icon": "☠"},
-    "Скеллиге": {"header": (64, 42, 92), "accent": (200, 172, 236), "icon": "⚓"},
-    "Королевства Севера": {"header": (30, 60, 100), "accent": (160, 198, 244), "icon": "⚜"},
-    "Синдикат": {"header": (156, 82, 26), "accent": (252, 210, 150), "icon": "⚖"},
-    "Скоя'таэли": {"header": (46, 78, 36), "accent": (182, 226, 130), "icon": "☘"},
-    "Нейтральная": {"header": (74, 66, 58), "accent": (226, 212, 182), "icon": "⚔"},
+    "Нильфгаард": {"header": None, "accent": (228, 180, 76), "icon": "☀"},
+    "Чудовища": {"header": (120, 30, 26), "accent": (238, 150, 120), "icon": "☠"},
+    "Скеллиге": {"header": (84, 54, 120), "accent": (200, 172, 236), "icon": "⚓"},
+    "Королевства Севера": {"header": (38, 76, 128), "accent": (160, 198, 244), "icon": "⚜"},
+    "Синдикат": {"header": (176, 92, 30), "accent": (252, 210, 150), "icon": "⚖"},
+    "Скоя'таэли": {"header": (56, 96, 44), "accent": (182, 226, 130), "icon": "☘"},
+    "Нейтральная": {"header": (96, 84, 72), "accent": (226, 212, 182), "icon": "⚔"},
 }
 DEFAULT_FACTION = FACTION_STYLES["Нейтральная"]
+FRAME_FILES = {"Золотая": "frame_gold.png", "Бронзовая": "frame_bronze.png"}
 
-FRAME_STYLES = {
-    "Золотая": {"light": (240, 204, 118), "dark": (138, 96, 36)},
-    "Бронзовая": {"light": (196, 136, 88), "dark": (100, 60, 32)},
-}
-
-DARK_FILL = (30, 27, 24)
-TEXT_LIGHT = (238, 228, 204)
-PROVISION_COLOR = (244, 202, 112)
-PARCHMENT = (218, 203, 170)
-INK = (42, 33, 25)
-KEYWORD_RED = (124, 22, 18)
-KEYWORD_DARK = (22, 17, 12)
-QUOTE_INK = (62, 50, 38)
+NAME_COLOR = (243, 238, 228)
+CATEGORY_COLOR = (226, 220, 208)
+POWER_COLOR = ((242, 220, 184), (184, 167, 139))
+PROVISION_COLOR = ((246, 208, 140), (238, 194, 120))
+INK = (16, 12, 10)
+KEYWORD_RED = (104, 14, 14)
+KEYWORD_DARK = (14, 11, 9)
+QUOTE_INK = (22, 17, 14)
 
 # Термины GWENT, которые в тексте способности выделяются жирным (сравнение по началу слова).
 KEYWORD_STEMS = (
     "размещени", "приказ", "взаимосвяз", "выносливост", "яд", "кровотечени", "уязвимост",
     "детонаци", "месть", "хитрост", "бессмерти", "порядок", "гармони", "дуэл", "заряд",
-    "щит", "блокировк", "заблокир", "усилени", "казн", "призыв",
+    "щит", "блокировк", "усилени", "казн", "призыв",
 )
 LABEL_RE = re.compile(r"(^|(?<=[.!?]\s)|(?<=\n))([^\s.!?:*][^.!?:*\n]{0,40}:)")
 
@@ -58,7 +70,17 @@ NORMAL, KEYWORD, BOLD = "normal", "keyword", "bold"
 
 @lru_cache(maxsize=64)
 def font(name: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    """name может быть «файл.ttf@ось1,ось2» для вариативных шрифтов."""
+    path, _, axes = name.partition("@")
+    fnt = ImageFont.truetype(os.path.join(FONT_DIR, path), size)
+    if axes:
+        fnt.set_variation_by_axes([float(v) for v in axes.split(",")])
+    return fnt
+
+
+@lru_cache(maxsize=8)
+def template(name: str) -> Image.Image:
+    return Image.open(os.path.join(CARD_DIR, name)).convert("RGBA")
 
 
 def strip_markup(text: str) -> str:
@@ -96,7 +118,11 @@ def parse_ability(text: str) -> list[tuple[str, str]]:
             if style == NORMAL and not word.isspace():
                 core = word.strip(".,;:!?«»\"()—-").lower()
                 if core and any(core.startswith(stem) for stem in KEYWORD_STEMS):
-                    styled.append((word, BOLD))
+                    # знаки препинания после термина в игре обычные, не жирные
+                    head = word.rstrip(".,;:!?»\")")
+                    styled.append((head, BOLD))
+                    if head != word:
+                        styled.append((word[len(head):], NORMAL))
                     continue
             styled.append((word, style))
     return styled
@@ -110,25 +136,40 @@ def style_color(style: str):
     return {NORMAL: INK, KEYWORD: KEYWORD_RED, BOLD: KEYWORD_DARK}[style]
 
 
-def wrap_rich(tokens: list[tuple[str, str]], size: int, max_width: int) -> list[list[tuple[str, str, int]]]:
-    """Перенос по словам с разными шрифтами. Возвращает строки из (слово, стиль, x)."""
-    lines: list[list[tuple[str, str, int]]] = [[]]
-    x = 0
-    space = font(FONT_REGULAR, size).getlength(" ")
+def wrap_rich(tokens: list[tuple[str, str]], size: int, max_width: float) -> list[list[tuple[str, str, int]]]:
+    """Перенос по словам с разными шрифтами. Возвращает строки из (слово, стиль, x).
+
+    Соседние токены без пробела между ними (слово + его знак препинания) не разрываются.
+    """
+    units: list[list[tuple[str, str]] | str] = []
     for word, style in tokens:
         if word.isspace():
-            if "\n" in word:
-                lines.extend([] for _ in range(word.count("\n")))
+            units.append(word)
+        elif units and not isinstance(units[-1], str):
+            units[-1].append((word, style))
+        else:
+            units.append([(word, style)])
+
+    lines: list[list[tuple[str, str, int]]] = [[]]
+    x = 0.0
+    space = font(FONT_REGULAR, size).getlength(" ")
+    for unit in units:
+        if isinstance(unit, str):
+            if "\n" in unit:
+                lines.extend([] for _ in range(unit.count("\n")))
                 x = 0
             elif lines[-1]:
                 x += space
             continue
-        width = style_font(style, size).getlength(word)
+        width = sum(style_font(st, size).getlength(w) for w, st in unit)
         if lines[-1] and x + width > max_width:
             lines.append([])
             x = 0
-        lines[-1].append((word, style, int(x)))
-        x += width
+        for w, st in unit:
+            lines[-1].append((w, st, int(x)))
+            x += style_font(st, size).getlength(w)
+    while lines and not lines[-1]:
+        lines.pop()
     return lines
 
 
@@ -146,184 +187,227 @@ def wrap_plain(text: str, fnt, max_width: int) -> list[str]:
     return lines
 
 
-def fit_font(text: str, name: str, start: int, minimum: int, max_width: int):
-    size = start
-    while size > minimum and font(name, size).getlength(text) > max_width:
-        size -= 2
-    return font(name, size)
+# ---------- примитивы ----------
+def cover(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Масштабирует с обрезкой по центру (чуть выше центра — там обычно лицо)."""
+    return ImageOps.fit(img.convert("RGB"), size, Image.LANCZOS, centering=(0.5, 0.4))
 
 
-# ---------- фактура ----------
-def noise_overlay(size: tuple[int, int], strength: int = 18) -> Image.Image:
-    noise = Image.effect_noise((size[0] // 2, size[1] // 2), strength).resize(size).filter(ImageFilter.GaussianBlur(1))
-    return noise
+def text_layer(text: str, fnt, fill, squeeze: float = 1.0, stroke: int = 0, stroke_fill=None):
+    """Текст на прозрачном слое, обрезанный по глифам; squeeze сужает по горизонтали."""
+    left, top, right, bottom = fnt.getbbox(text, stroke_width=stroke)
+    layer = Image.new("RGBA", (right - left + 4, bottom - top + 4), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((2 - left, 2 - top), text, font=fnt, fill=fill,
+                               stroke_width=stroke, stroke_fill=stroke_fill)
+    layer = layer.crop(layer.getbbox() or (0, 0, 1, 1))
+    if squeeze != 1.0:
+        layer = layer.resize((max(1, round(layer.width * squeeze)), layer.height), Image.LANCZOS)
+    return layer
 
 
-def textured(size: tuple[int, int], color: tuple[int, int, int], vignette: float = 0.35) -> Image.Image:
-    base = Image.new("RGB", size, color)
-    noise = noise_overlay(size)
-    base = Image.blend(base, Image.merge("RGB", (noise, noise, noise)), 0.08)
-    # Затемнение к краям, как у старого пергамента.
-    mask = Image.new("L", size, 0)
-    ImageDraw.Draw(mask).rectangle((size[0] * 0.06, size[1] * 0.08, size[0] * 0.94, size[1] * 0.92), fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(min(size) * 0.12))
-    dark = Image.new("RGB", size, tuple(int(c * (1 - vignette)) for c in color))
-    return Image.composite(base, dark, mask)
+def with_shadow(layer: Image.Image, offset: int = 3, alpha: int = 170) -> Image.Image:
+    out = Image.new("RGBA", (layer.width + offset, layer.height + offset), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+    shadow.putalpha(layer.getchannel("A").point(lambda a: a * alpha // 255))
+    out.alpha_composite(shadow, (offset, offset))
+    out.alpha_composite(layer, (0, 0))
+    return out
 
 
-def background() -> Image.Image:
-    bg = Image.new("RGB", (CANVAS_W, CANVAS_H), (16, 13, 11))
-    glow = Image.new("L", (CANVAS_W, CANVAS_H), 0)
-    ImageDraw.Draw(glow).ellipse((200, 100, CANVAS_W - 200, CANVAS_H - 100), fill=255)
-    glow = glow.filter(ImageFilter.GaussianBlur(220))
-    bg = Image.composite(Image.new("RGB", bg.size, (44, 36, 29)), bg, glow)
-    noise = noise_overlay(bg.size, 30)
-    return Image.blend(bg, Image.merge("RGB", (noise, noise, noise)), 0.04)
+def gradient_fill(layer: Image.Image, top, bottom) -> Image.Image:
+    """Перекрашивает непрозрачные пиксели слоя вертикальным градиентом (как цифры в игре)."""
+    t = np.linspace(0, 1, layer.height)[:, None, None]
+    rgb = (np.array(top) * (1 - t) + np.array(bottom) * t).repeat(layer.width, axis=1)
+    out = Image.fromarray(rgb.astype(np.uint8), "RGB").convert("RGBA")
+    out.putalpha(layer.getchannel("A"))
+    return out
 
 
-def drop_shadow(canvas: Image.Image, box: tuple[int, int, int, int], radius: int = 18, offset: int = 10):
-    shadow = Image.new("L", canvas.size, 0)
-    x0, y0, x1, y1 = box
-    ImageDraw.Draw(shadow).rounded_rectangle((x0 + offset, y0 + offset, x1 + offset, y1 + offset), 10, fill=190)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius))
-    canvas.paste(Image.new("RGB", canvas.size, (0, 0, 0)), (0, 0), shadow)
+def digits(value: int, height: int, colors, max_width: int = 10_000) -> Image.Image:
+    text = str(value)
+    size = height
+    fnt = font(FONT_DIGITS, size)
+    # подбираем кегль так, чтобы высота цифр совпала с оригиналом
+    for _ in range(3):
+        _, top, _, bottom = fnt.getbbox(text)
+        size = max(10, round(size * height / max(1, bottom - top)))
+        fnt = font(FONT_DIGITS, size)
+    light, dark = colors
+    layer = text_layer(text, fnt, (255, 255, 255), stroke=max(2, height // 30), stroke_fill=(0, 0, 0))
+    body = gradient_fill(text_layer(text, fnt, (255, 255, 255)), light, dark)
+    outline = Image.new("RGBA", layer.size, (22, 16, 12, 255))
+    outline.putalpha(layer.getchannel("A"))
+    pad = max(2, height // 30)
+    outline.alpha_composite(body, ((layer.width - body.width) // 2, pad))
+    if outline.width > max_width:
+        outline = outline.resize((max_width, outline.height), Image.LANCZOS)
+    return with_shadow(outline, offset=max(2, height // 28))
+
+
+def paste_centered(canvas: Image.Image, layer: Image.Image, center: tuple[int, int]):
+    canvas.alpha_composite(layer, (center[0] - layer.width // 2, center[1] - layer.height // 2))
+
+
+def tint_header(canvas: Image.Image, color):
+    """Перекрашивает тёмную фактурную шапку в цвет фракции, сохраняя фактуру."""
+    box = HEADER
+    region = np.asarray(canvas.crop(box).convert("RGB")).astype(np.float32)
+    lum = region.mean(axis=2, keepdims=True)
+    tinted = lum / max(1.0, float(lum.mean())) * np.array(color, dtype=np.float32) * 0.9
+    # края шапки (рамка панели) оставляем как есть
+    mask = np.zeros(lum.shape[:2], dtype=np.float32)
+    mask[6:-8, 6:-6] = 1.0
+    mask = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).filter(
+        ImageFilter.GaussianBlur(4))).astype(np.float32)[..., None] / 255
+    out = region * (1 - mask) + np.clip(tinted, 0, 255) * mask
+    canvas.paste(Image.fromarray(out.astype(np.uint8), "RGB").convert("RGBA"), box[:2])
+
+
+def shield_layer(value: int) -> Image.Image:
+    w, h = 120, 136
+    layer = Image.new("RGBA", (w + 6, h + 6), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    pts = [(3, 3), (w + 3, 3), (w + 3, h * 0.55), (w / 2 + 3, h + 3), (3, h * 0.55)]
+    d.polygon(pts, fill=(34, 30, 26, 255), outline=(206, 170, 96, 255), width=5)
+    paste_centered(layer, digits(value, 62, POWER_COLOR), (w // 2 + 3, int(h * 0.44)))
+    return with_shadow(layer, 4)
+
+
+def faction_icon(faction: str, style: dict) -> Image.Image:
+    if faction == "Нильфгаард":
+        return template("icon_nilfgaard.png")
+    size = 150
+    fnt = font(FONT_ICONS, size)
+    return with_shadow(text_layer(style["icon"], fnt, style["accent"], stroke=2, stroke_fill=(24, 18, 12)), 4)
+
+
+def to_int(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------- карта ----------
-def diamond(cx: int, cy: int, r: int):
-    return [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
-
-
-def shield(cx: int, cy: int, s: int):
-    return [(cx - s, cy - s), (cx + s, cy - s), (cx + s, cy + s * 0.2), (cx, cy + s * 1.15), (cx - s, cy + s * 0.2)]
-
-
-def centered_text(draw: ImageDraw.ImageDraw, center: tuple[int, int], text: str, fnt, fill):
-    draw.text(center, text, font=fnt, fill=fill, anchor="mm", stroke_width=2, stroke_fill=(10, 8, 6))
-
-
 def draw_card(canvas: Image.Image, art: Image.Image, data: dict):
-    frame = FRAME_STYLES.get(data.get("frame"), FRAME_STYLES["Бронзовая"])
-    x0, y0, x1, y1 = CARD_X, CARD_Y, CARD_X + CARD_W, CARD_Y + CARD_H
-    drop_shadow(canvas, (x0, y0, x1, y1))
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((x0, y0, x1, y1), 8, fill=frame["dark"])
-    draw.rounded_rectangle((x0 + 3, y0 + 3, x1 - 3, y1 - 3), 7, fill=frame["light"])
-    draw.rectangle((x0 + BORDER - 2, y0 + BORDER - 2, x1 - BORDER + 2, y1 - BORDER + 2), fill=frame["dark"])
+    x0, y0, x1, y1 = ART_WINDOW
+    canvas.paste(cover(art, (x1 - x0, y1 - y0)), (x0, y0))
+    frame = template(FRAME_FILES.get(data.get("frame"), FRAME_FILES["Бронзовая"]))
+    canvas.alpha_composite(frame, CARD_ORIGIN)
 
-    inner = (CARD_W - 2 * BORDER, CARD_H - 2 * BORDER)
-    art = ImageOps.fit(art.convert("RGB"), inner, Image.LANCZOS, centering=(0.5, 0.3))
-    canvas.paste(art, (x0 + BORDER, y0 + BORDER))
-    draw = ImageDraw.Draw(canvas)
-
-    # Сила — ромб в левом верхнем углу.
-    cx, cy, r = x0 + 82, y0 + 82, 68
-    draw.polygon(diamond(cx, cy, r + 4), fill=frame["dark"])
-    draw.polygon(diamond(cx, cy, r), fill=frame["light"])
-    draw.polygon(diamond(cx, cy, r - 8), fill=DARK_FILL)
-    draw.polygon(diamond(cx, cy, r - 14), outline=frame["dark"], width=2)
-    centered_text(draw, (cx, cy + 2), str(data.get("power", "")), font(FONT_BOLD, 88), TEXT_LIGHT)
-
-    # Броня — щит под ромбом (только если она есть).
-    armor = str(data.get("armor", "0"))
-    if armor.isdigit() and int(armor) > 0:
-        sx, sy, s = cx, cy + r + 46, 34
-        draw.polygon(shield(sx, sy, s + 4), fill=frame["dark"])
-        draw.polygon(shield(sx, sy, s), fill=frame["light"])
-        draw.polygon(shield(sx, sy, s - 5), fill=DARK_FILL)
-        centered_text(draw, (sx, sy + 2), armor, font(FONT_BOLD, 44), TEXT_LIGHT)
-
-    # Стоимость найма — плашка в правом нижнем углу.
-    bw, bh = 106, 126
-    bx1, by1 = x1 - BORDER + 2, y1 - BORDER + 2
-    bx0, by0 = bx1 - bw, by1 - bh
-    draw.rectangle((bx0 - 4, by0 - 4, bx1, by1), fill=frame["dark"])
-    draw.rectangle((bx0, by0, bx1, by1), fill=frame["light"])
-    draw.rectangle((bx0 + 6, by0 + 6, bx1 - 6, by1 - 6), fill=DARK_FILL)
-    centered_text(draw, ((bx0 + bx1) // 2, (by0 + by1) // 2 + 2), str(data.get("provision", "")),
-                  font(FONT_BOLD, 90), PROVISION_COLOR)
+    power = to_int(data.get("power"))
+    if power is not None:
+        paste_centered(canvas, digits(power, POWER_HEIGHT, POWER_COLOR, POWER_MAX_W), POWER_CENTER)
+    provision = to_int(data.get("provision"))
+    if provision is not None:
+        paste_centered(canvas, digits(provision, PROVISION_HEIGHT, PROVISION_COLOR, PROVISION_MAX_W), PROVISION_CENTER)
+    armor = to_int(data.get("armor"))
+    if armor and armor > 0:
+        paste_centered(canvas, shield_layer(armor), ARMOR_CENTER)
 
 
-def layout_body(data: dict, width: int, ability_size: int):
-    tokens = parse_ability(data.get("ability", ""))
-    ability_lines = wrap_rich(tokens, ability_size, width)
-    quote_size = max(26, ability_size - 6)
-    quote_font = font(FONT_ITALIC, quote_size)
-    quote = data.get("quote", "").strip()
-    quote_lines = wrap_plain(quote, quote_font, width) if quote else []
-    ability_lh, quote_lh = int(ability_size * 1.22), int(quote_size * 1.3)
-    height = len(ability_lines) * ability_lh
+# ---------- панель ----------
+def draw_header(canvas: Image.Image, data: dict):
+    faction = data.get("faction")
+    style = FACTION_STYLES.get(faction, DEFAULT_FACTION)
+    if style["header"]:
+        tint_header(canvas, style["header"])
+
+    icon = faction_icon(faction, style)
+    ix0, iy0, ix1, iy1 = ICON_BOX
+    paste_centered(canvas, icon, ((ix0 + ix1) // 2, (iy0 + iy1) // 2))
+
+    max_w = ix0 - NAME_POS[0] - 30
+    name = strip_markup(data.get("name", "")).upper().strip() or " "
+    size = round(NAME_CAP / 0.71)
+    name_font = font(FONT_NAME, size)
+    layer = text_layer(name, name_font, NAME_COLOR, squeeze=NAME_SQUEEZE)
+    # выравниваем по верху прописных, а не по надстрочным знакам (Й, Ё)
+    rise = name_font.getbbox("Н")[1] - name_font.getbbox(name)[1]
+    if layer.width > max_w:
+        scale = max(0.7, max_w / layer.width)
+        rise = round(rise * scale)
+        layer = layer.resize((max_w, max(1, round(layer.height * scale))), Image.LANCZOS)
+    canvas.alpha_composite(with_shadow(layer, 3, 200), (NAME_POS[0], NAME_POS[1] - rise))
+
+    category = strip_markup(data.get("category", "")).strip()
+    if category:
+        size = CATEGORY_SIZE
+        while size > 34 and font(FONT_REGULAR, size).getlength(category) > max_w:
+            size -= 2
+        fnt = font(FONT_REGULAR, size)
+        cap_top = fnt.getbbox("Ч")[1]
+        draw = ImageDraw.Draw(canvas)
+        draw.text((CATEGORY_POS[0] + 2, CATEGORY_POS[1] - cap_top + 2), category, font=fnt, fill=(8, 6, 5))
+        draw.text((CATEGORY_POS[0], CATEGORY_POS[1] - cap_top), category, font=fnt, fill=CATEGORY_COLOR)
+
+
+# Шрифт в игре уже Roboto Condensed: рисуем крупнее и сжимаем по ширине.
+BODY_SQUEEZE, BODY_GROW = 0.92, 1.08
+QUOTE_GROW = 1.02
+
+
+def layout_body(data: dict, size: int):
+    width = (TEXT_RIGHT - TEXT_LEFT) / BODY_SQUEEZE
+    glyph = round(size * BODY_GROW)
+    lines = wrap_rich(parse_ability(data.get("ability", "")), glyph, width)
+    quote = strip_markup(data.get("quote", "")).strip()
+    quote_font = font(FONT_ITALIC, round(size * QUOTE_GROW))
+    quote_lines = wrap_plain(quote, quote_font, TEXT_RIGHT - TEXT_LEFT) if quote else []
+    pitch = size * 1.195
+    height = len(lines) * pitch
     if quote_lines:
-        height += 60 + len(quote_lines) * quote_lh
-    return ability_lines, ability_lh, quote_lines, quote_font, quote_lh, height
+        height += (size * 1.52 - pitch) + 43 + len(quote_lines) * pitch * 0.985
+    return lines, quote_lines, pitch, height
 
 
-def draw_panel(canvas: Image.Image, data: dict):
-    style = FACTION_STYLES.get(data.get("faction"), DEFAULT_FACTION)
-    text_w = PANEL_W - 2 * PAD
+def draw_line(canvas: Image.Image, y: float, glyph: int, words, squeeze: float = BODY_SQUEEZE):
+    """words: (текст, шрифт, цвет, x). Строка рисуется на слое и сжимается по ширине."""
+    cap_top = font(FONT_REGULAR, glyph).getbbox("Н")[1]
+    layer = Image.new("RGBA", (int((TEXT_RIGHT - TEXT_LEFT) / squeeze) + 80, glyph * 2), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    for text, fnt, fill, x in words:
+        draw.text((x, glyph // 2 - cap_top), text, font=fnt, fill=fill)
+    if squeeze != 1.0:
+        layer = layer.resize((round(layer.width * squeeze), layer.height), Image.LANCZOS)
+    canvas.alpha_composite(layer, (TEXT_LEFT, round(y) - glyph // 2))
 
-    ability_size = 40
+
+def draw_body(canvas: Image.Image, data: dict):
+    size = 63
     while True:
-        ability_lines, ability_lh, quote_lines, quote_font, quote_lh, body_h = layout_body(data, text_w, ability_size)
-        if HEADER_H + body_h + 2 * PAD <= CARD_H or ability_size <= 26:
+        lines, quote_lines, pitch, height = layout_body(data, size)
+        if BODY_TOP + height <= BODY_BOTTOM or size <= 34:
             break
-        ability_size -= 2
-    panel_h = max(HEADER_H + body_h + 2 * PAD, 360)
-    x0, y0 = PANEL_X, CARD_Y
-    x1, y1 = x0 + PANEL_W, y0 + panel_h
+        size -= 1
+    glyph = round(size * BODY_GROW)
 
-    drop_shadow(canvas, (x0, y0, x1, y1))
-    canvas.paste(textured((PANEL_W, panel_h - HEADER_H), PARCHMENT, 0.18), (x0, y0 + HEADER_H))
-    header = textured((PANEL_W, HEADER_H), style["header"], 0.45)
-    canvas.paste(header, (x0, y0))
-    draw = ImageDraw.Draw(canvas)
-    draw.line((x0, y0 + HEADER_H, x1, y0 + HEADER_H), fill=(20, 16, 12), width=3)
-    draw.rectangle((x0, y0, x1, y1), outline=(56, 46, 36), width=3)
+    y = BODY_TOP
+    for line in lines:
+        draw_line(canvas, y, glyph, [(w, style_font(s, glyph), style_color(s), x) for w, s, x in line])
+        y += pitch
 
-    # Шапка: имя, категория, значок фракции.
-    icon_size = 92
-    name_max = PANEL_W - 2 * PAD - icon_size - 30
-    name = strip_markup(data.get("name", "")).upper()
-    name_font = fit_font(name, FONT_BOLD, 66, 34, name_max)
-    draw.text((x0 + PAD, y0 + 62), name, font=name_font, fill=(246, 240, 228), anchor="ls",
-              stroke_width=1, stroke_fill=(15, 12, 10))
-    category_font = fit_font(data.get("category", ""), FONT_REGULAR, 36, 24, name_max)
-    draw.text((x0 + PAD, y0 + 112), data.get("category", ""), font=category_font, fill=(226, 216, 196), anchor="ls")
-    icon_center = (x1 - PAD - icon_size // 2, y0 + HEADER_H // 2)
-    draw.text((icon_center[0] + 3, icon_center[1] + 3), style["icon"], font=font(FONT_ICONS, icon_size),
-              fill=(10, 8, 6), anchor="mm")
-    draw.text(icon_center, style["icon"], font=font(FONT_ICONS, icon_size), fill=style["accent"], anchor="mm",
-              stroke_width=1, stroke_fill=(20, 16, 12))
-
-    # Текст способности.
-    y = y0 + HEADER_H + PAD
-    for line in ability_lines:
-        for word, word_style, offset in line:
-            draw.text((x0 + PAD + offset, y), word, font=style_font(word_style, ability_size),
-                      fill=style_color(word_style), anchor="la")
-        y += ability_lh
-
-    # Разделитель и цитата.
     if quote_lines:
-        y += 24
-        sep_w = int(text_w * 0.7)
-        sx = x0 + PAD + 10
-        for i in range(sep_w):
-            fade = min(i, sep_w - i) / (sep_w * 0.25)
-            alpha = min(1.0, fade)
-            color = tuple(int(PARCHMENT[c] + (110 - PARCHMENT[c]) * alpha) for c in range(3))
-            draw.line((sx + i, y, sx + i, y + 2), fill=color)
-        y += 30
+        if lines:
+            sep = template("separator.png")
+            sep_y = round(y - pitch + size * 1.52)
+            sep_x = (TEXT_LEFT + TEXT_RIGHT) // 2 - sep.width // 2 - 20
+            canvas.alpha_composite(sep, (sep_x, sep_y - sep.height // 2))
+            y = sep_y + 43
+        q_size = round(size * QUOTE_GROW)
+        qf = font(FONT_ITALIC, q_size)
         for line in quote_lines:
-            draw.text((x0 + PAD, y), line, font=quote_font, fill=QUOTE_INK, anchor="la")
-            y += quote_lh
+            draw_line(canvas, y, q_size, [(line, qf, QUOTE_INK, 0)], squeeze=1.0)
+            y += pitch * 0.985
+
 
 
 def render_card(art_bytes: bytes, data: dict) -> bytes:
     art = Image.open(io.BytesIO(art_bytes))
-    canvas = background()
+    canvas = Image.open(os.path.join(CARD_DIR, "background.jpg")).convert("RGBA")
     draw_card(canvas, art, data)
-    draw_panel(canvas, data)
+    draw_header(canvas, data)
+    draw_body(canvas, data)
     out = io.BytesIO()
-    canvas.save(out, format="JPEG", quality=92, optimize=True)
+    canvas.crop(CROP).convert("RGB").save(out, format="JPEG", quality=90, optimize=True)
     return out.getvalue()
