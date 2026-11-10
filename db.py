@@ -38,6 +38,21 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, kind);
+
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code       TEXT PRIMARY KEY,
+    amount     INTEGER NOT NULL,
+    max_uses   INTEGER NOT NULL DEFAULT 0,   -- 0 — без ограничения
+    uses       INTEGER NOT NULL DEFAULT 0,
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS promo_uses (
+    code       TEXT NOT NULL,
+    user_id    INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (code, user_id)
+);
 """
 
 FLAGS = ("blocked", "unlimited")
@@ -62,6 +77,11 @@ class Database:
             if "art_file_id" not in columns:
                 # Чистый арт без рамки — исходник для правок.
                 self.conn.execute("ALTER TABLE cards ADD COLUMN art_file_id TEXT")
+            user_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
+            if "free_used" not in user_columns:
+                self.conn.execute("ALTER TABLE users ADD COLUMN free_used INTEGER NOT NULL DEFAULT 0")
+                # Пробная картища — только тем, у кого ещё нет ни одной карты.
+                self.conn.execute("UPDATE users SET free_used = 1 WHERE user_id IN (SELECT user_id FROM cards)")
 
     def _one(self, sql: str, params=()):
         with self.lock:
@@ -154,6 +174,54 @@ class Database:
                 (user_id, -amount, kind, now()),
             )
             return True
+
+    # ---------- пробная картища ----------
+    def claim_trial(self, user_id: int) -> bool:
+        with self.lock, self.conn:
+            cur = self.conn.execute("UPDATE users SET free_used = 1 WHERE user_id = ? AND free_used = 0", (user_id,))
+            return cur.rowcount > 0
+
+    def release_trial(self, user_id: int):
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE users SET free_used = 0 WHERE user_id = ?", (user_id,))
+
+    # ---------- промокоды ----------
+    def create_promo(self, code: str, amount: int, max_uses: int) -> bool:
+        with self.lock, self.conn:
+            try:
+                self.conn.execute(
+                    "INSERT INTO promo_codes (code, amount, max_uses, created_at) VALUES (?, ?, ?, ?)",
+                    (code, amount, max_uses, now()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def list_promos(self):
+        return self._all("SELECT * FROM promo_codes WHERE active = 1 ORDER BY created_at DESC")
+
+    def deactivate_promo(self, code: str):
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE promo_codes SET active = 0 WHERE code = ?", (code,))
+
+    def redeem_promo(self, code: str, user_id: int) -> tuple[str, int]:
+        """Статус: ok / not_found / used / exhausted. Звёзды начисляются в той же транзакции."""
+        with self.lock, self.conn:
+            promo = self.conn.execute("SELECT * FROM promo_codes WHERE code = ? AND active = 1", (code,)).fetchone()
+            if promo is None:
+                return "not_found", 0
+            if self.conn.execute("SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ?", (code, user_id)).fetchone():
+                return "used", 0
+            if promo["max_uses"] and promo["uses"] >= promo["max_uses"]:
+                return "exhausted", 0
+            self.conn.execute("INSERT INTO promo_uses (code, user_id, created_at) VALUES (?, ?, ?)", (code, user_id, now()))
+            self.conn.execute("UPDATE promo_codes SET uses = uses + 1 WHERE code = ?", (code,))
+            self.conn.execute(
+                "INSERT INTO transactions (user_id, amount, kind, created_at) VALUES (?, ?, 'promo', ?)",
+                (user_id, promo["amount"], now()),
+            )
+            self.conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (promo["amount"], user_id))
+            return "ok", promo["amount"]
 
     # ---------- картищи ----------
     def add_card(self, user_id: int, data: dict, file_id: str, art_file_id: Optional[str] = None,

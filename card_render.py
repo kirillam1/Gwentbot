@@ -52,6 +52,8 @@ BOTTOM_PAD_QUOTE, BOTTOM_PAD_ABILITY = 66, 72        # от верха проп�
 MAX_PANEL_BOTTOM = 1190
 CROP_X, CROP_TOP, CROP_MARGIN = (250, 1896), 165, 31
 CARD_BOTTOM = 1030
+CARD_ONLY_BOX = (258, 170, 866, 1058)           # вторая картинка: карта в рамке без панели
+WATERMARK_TEXT = "ЛАВК · ПРОБНАЯ"
 
 INK = (36, 24, 12)
 KEYWORD_RED = (98, 18, 12)
@@ -76,7 +78,8 @@ KEYWORD_STEMS = (
     "размещени", "приказ", "взаимосвяз", "выносливост", "яд", "кровотечени", "уязвимост",
     "детонаци", "месть", "хитрост", "бессмерти", "порядок", "гармони", "дуэл", "заряд",
     "щит", "блокировк", "казн", "призыв", "брони", "броню", "броня", "поглот", "удалите", "создайте",
-    "обреченност", "преданност", "адреналин", "столкновени",
+    "обреченност", "преданност", "адреналин", "столкновени", "завещани", "засад", "шпионаж", "экипаж",
+    "воодушевлени", "берсерк", "ветеран", "доминировани", "ассимиляц", "симбиоз", "рвени", "подношени",
 )
 LABEL_RE = re.compile(r"(^|(?<=[.!?]\s)|(?<=\n))([^\s.!?:*][^.!?:*\n]{0,40})(?=:)")
 
@@ -453,13 +456,42 @@ def draw_panel(canvas: Image.Image, data: dict) -> int:
     return bottom
 
 
-def render_card(art_bytes: bytes, data: dict) -> bytes:
+def watermark(img: Image.Image) -> Image.Image:
+    """Крупные диагональные надписи поверх всей картинки — для пробной картищи."""
+    w, h = img.size
+    fnt = font(FONT_NAME, max(36, int((w * h) ** 0.5) // 11))
+    text = WATERMARK_TEXT
+    step_x = round(fnt.getlength(text + "   "))
+    step_y = round(fnt.size * 2.6)
+    side = int((w ** 2 + h ** 2) ** 0.5) + step_x
+    layer = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    for row, y in enumerate(range(0, side, step_y)):
+        for x in range(-step_x + (row % 2) * step_x // 2, side, step_x):
+            draw.text((x, y), text, font=fnt, fill=(255, 255, 255, 120),
+                      stroke_width=max(2, fnt.size // 18), stroke_fill=(0, 0, 0, 90))
+    layer = layer.rotate(30, resample=Image.BICUBIC)
+    left, top = (side - w) // 2, (side - h) // 2
+    out = img.convert("RGBA")
+    out.alpha_composite(layer.crop((left, top, left + w, top + h)))
+    return out
+
+
+def to_jpeg(img: Image.Image) -> bytes:
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+    return out.getvalue()
+
+
+def render_card(art_bytes: bytes, data: dict, trial: bool = False) -> tuple[bytes, bytes]:
+    """Возвращает (полная карта с панелью, только карта в рамке без пергамента)."""
     art = Image.open(io.BytesIO(art_bytes))
     canvas = asset("background.jpg").copy()
     bottom = draw_panel(canvas, data)
     draw_card(canvas, art, data)
     crop_bottom = min(canvas.height, max(CARD_BOTTOM, bottom) + CROP_MARGIN)
-    out = io.BytesIO()
-    canvas.crop((CROP_X[0], CROP_TOP, CROP_X[1], crop_bottom)).convert("RGB").save(
-        out, format="JPEG", quality=92, optimize=True)
-    return out.getvalue()
+    full = canvas.crop((CROP_X[0], CROP_TOP, CROP_X[1], crop_bottom))
+    card_only = canvas.crop(CARD_ONLY_BOX)
+    if trial:
+        full, card_only = watermark(full), watermark(card_only)
+    return to_jpeg(full), to_jpeg(card_only)
