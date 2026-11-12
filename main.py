@@ -793,7 +793,8 @@ def warm_scenes():
                 uploaded = False
                 for admin_id in ADMIN_IDS:
                     try:
-                        msg = bot.send_photo(admin_id, scene_upload_bytes(src), disable_notification=True,
+                        msg = bot.send_photo(admin_id, photo_source(scene_upload_bytes(src), "scene.jpg"),
+                                             disable_notification=True,
                                              timeout=SCENE_UPLOAD_TIMEOUT)
                     except Exception as e:
                         logger.warning("Не удалось загрузить картинку %s через админа %s: %s", src, admin_id, e)
@@ -1732,7 +1733,8 @@ def cb_deck(call):
         # Доставка не была подтверждена — собираем карту заново из сохранённого арта.
         with RENDER_LOCK:
             full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")))
-        msg = tg_retry(bot.send_photo, chat_id, full, caption=caption, reply_markup=markup, timeout=MEDIA_TIMEOUT)
+        msg = tg_retry(bot.send_photo, chat_id, photo_source(full), caption=caption, reply_markup=markup,
+                       timeout=MEDIA_TIMEOUT)
         db.set_card_file(card["id"], msg.photo[-1].file_id)
         return
 
@@ -1956,6 +1958,36 @@ def fal_with_retry(endpoint: str, make_payload: Callable[[], dict]) -> bytes:
         return request_fal_image(endpoint, make_payload())
 
 
+def fal_upload(data: bytes, content_type: str = "image/jpeg", name: str = "card.jpg") -> Optional[str]:
+    """Кладёт файл в хранилище Fal и возвращает публичную ссылку. None — не вышло.
+
+    Канал Amvera → Telegram очень медленный, а до Fal быстрый. Если дать Telegram ссылку,
+    он сам скачает картинку с Fal, и с Amvera уйдёт только короткий запрос.
+    """
+    if not FAL_KEY:
+        return None
+    try:
+        init = requests.post(
+            "https://rest.fal.ai/storage/upload/initiate?storage_type=gcs",
+            json={"file_name": name, "content_type": content_type},
+            headers={"Authorization": f"Key {FAL_KEY}", "Accept": "application/json"},
+            timeout=20,
+        )
+        init.raise_for_status()
+        info = init.json()
+        put = requests.put(info["upload_url"], data=data, headers={"Content-Type": content_type}, timeout=60)
+        put.raise_for_status()
+        return info["file_url"]
+    except Exception as e:
+        logger.warning("Не удалось выложить картинку на Fal: %s", e)
+        return None
+
+
+def photo_source(data: bytes, name: str = "card.jpg"):
+    """Ссылка на картинку (если удалось выложить на Fal) или сами байты как запасной путь."""
+    return fal_upload(data, name=name) or data
+
+
 def tg_retry(func, *args, attempts: int = 3, **kwargs):
     """Повтор отправки в Telegram при флуд-лимите, 5xx и обрыве связи — чтобы готовая карта не терялась."""
     for attempt in range(1, attempts + 1):
@@ -2128,7 +2160,9 @@ def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[object], Non
             edit_screen(chat_id, status, "🎨 <b>Твоя очередь!</b> " + random.choice(LAVK_WAIT_PHRASES) + WAIT_INTRO)
         slot = True
         threading.Thread(target=status_ticker, args=(chat_id, status, stop), daemon=True).start()
+        started = time.monotonic()
         job(status)
+        logger.info("Задача для %s выполнена за %.0f с", chat_id, time.monotonic() - started)
     except Exception as e:
         stop.set()
         if isinstance(e, FalError):
@@ -2178,12 +2212,14 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
     with RENDER_LOCK:
         full, card_only = render_card(art, card_data, trial=trial)
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
+    started = time.monotonic()
     try:
         sent = tg_retry(bot.send_media_group, chat_id, [
-            types.InputMediaPhoto(full, caption=caption, parse_mode="HTML"),
-            types.InputMediaPhoto(card_only),
+            types.InputMediaPhoto(photo_source(full, "card_full.jpg"), caption=caption, parse_mode="HTML"),
+            types.InputMediaPhoto(photo_source(card_only, "card_frame.jpg")),
         ], timeout=MEDIA_TIMEOUT)
         file_id = sent[0].photo[-1].file_id
+        logger.info("Карта для %s отправлена в Telegram за %.0f с", chat_id, time.monotonic() - started)
     except requests.ReadTimeout:
         # Файлы ушли, но Telegram не успел ответить — карта почти наверняка уже у человека.
         # Не повторяем (будет дубль) и не возвращаем звёзды: сохраняем в колоду без file_id,
@@ -2277,6 +2313,7 @@ def generate_card(chat_id: int, data: dict, mode: str):
             "max_sequence_length": "512",
             "seed": random.randint(1, 2 ** 31 - 1),
         })
+        logger.info("Арт для %s нарисован", chat_id)
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
         if gender:
@@ -2479,6 +2516,7 @@ def edit_card(chat_id: int, card: dict, instruction: str, mode: str, preset: Opt
             art = edit_with_identity(source, english, restore=(kind == "other"))
         card_data = dict(card["data"], edit=instruction)
         card_data.pop("trial", None)
+        logger.info("Правка для %s нарисована", chat_id)
         deliver_card(chat_id, art, card_data, "✏️ <b>ПРАВКА ГОТОВА!</b>", status, parent_id=card["id"])
 
     run_art_job(chat_id, EDIT_PRICE, mode, job)
