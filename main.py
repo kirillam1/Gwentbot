@@ -39,6 +39,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+# Запасные модели: у каждой свой бесплатный суточный лимит. Когда основная исчерпана — идём дальше.
+GEMINI_MODELS = list(dict.fromkeys(
+    [GEMINI_MODEL] + [m.strip() for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-2.5-flash").split(",") if m.strip()]))
 FAL_KEY = os.getenv("FAL_API_KEY")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
 # На Amvera постоянное хранилище — /data: база там переживает пересборки.
@@ -888,23 +892,65 @@ bot.setup_middleware(AccessMiddleware())
 # ==========================================
 # 4. ГЕНЕРАЦИЯ ПОЛЕЙ (Gemini / случайные числа)
 # ==========================================
-def gemini_raw(prompt, temperature: float, json_mode: bool = False, attempts: int = 2) -> Optional[str]:
-    """Текст ответа Gemini с повтором (лимиты и сбои сети бывают часто). None — не вышло."""
+_gemini_blocked: dict[str, float] = {}  # модель -> до какого времени не трогаем
+_gemini_lock = threading.Lock()
+
+
+def _retry_delay(e: Exception) -> float:
+    """Через сколько секунд Google разрешает повторить (из ответа 429)."""
+    m = re.search(r"retryDelay'?\"?:\s*'?\"?(\d+(?:\.\d+)?)s", str(e))
+    return float(m.group(1)) if m else 60.0
+
+
+def gemini_generate(contents, config) -> Optional[str]:
+    """Один ответ Gemini: перебирает модели, пропуская те, у которых исчерпан лимит.
+
+    Модель с исчерпанной квотой отключается до сброса лимита — бот не тратит время
+    на заведомо неудачные запросы. None — ни одна модель сейчас не доступна.
+    """
     if gemini_client is None:
         return None
+    for model in GEMINI_MODELS:
+        with _gemini_lock:
+            if time.time() < _gemini_blocked.get(model, 0):
+                continue
+        for attempt in (1, 2):
+            try:
+                response = gemini_client.models.generate_content(model=model, contents=contents, config=config)
+                text = (response.text or "").strip()
+                if text:
+                    return text
+                break  # пустой ответ — пробуем следующую модель
+            except Exception as e:
+                code = getattr(e, "code", None)
+                if code == 429:
+                    delay = _retry_delay(e)
+                    with _gemini_lock:
+                        _gemini_blocked[model] = time.time() + delay
+                    logger.warning("Gemini %s: лимит исчерпан, отключаю на %s — пробую запасную модель",
+                                   model, time.strftime("%H:%M:%S", time.gmtime(delay)) if delay < 86400 else "сутки")
+                    break
+                if code == 404:
+                    # Такой модели нет (или нет у этого ключа) — больше не пробуем.
+                    with _gemini_lock:
+                        _gemini_blocked[model] = time.time() + 6 * 3600
+                    logger.warning("Gemini %s недоступна: %s", model, str(e)[:200])
+                    break
+                if code in (400, 403):
+                    logger.warning("Gemini %s отклонил запрос (%s): %s", model, code, str(e)[:200])
+                    break
+                logger.warning("Ошибка Gemini %s (попытка %s/2): %s", model, attempt, str(e)[:300])
+                if attempt == 1:
+                    time.sleep(2)
+    logger.warning("Gemini: все модели сейчас недоступны, обхожусь без него")
+    return None
+
+
+def gemini_raw(prompt, temperature: float, json_mode: bool = False) -> Optional[str]:
+    """Текст ответа Gemini. None — не вышло."""
     config = genai_types.GenerateContentConfig(
         temperature=temperature, response_mime_type="application/json" if json_mode else None)
-    for attempt in range(1, attempts + 1):
-        try:
-            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
-            text = (response.text or "").strip()
-            if text:
-                return text
-        except Exception as e:
-            logger.warning("Ошибка Gemini (попытка %s/%s): %s", attempt, attempts, e)
-        if attempt < attempts:
-            time.sleep(2 * attempt)
-    return None
+    return gemini_generate(prompt, config)
 
 
 def ask_gemini(prompt: str, keep_markup: bool = False, temperature: float = 1.2) -> Optional[str]:
@@ -2332,38 +2378,32 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
     return card_id
 
 
-def translate_role(category: str) -> Optional[str]:
-    return ask_gemini(
-        "Translate this fantasy character class into English, 1-4 words, reply with the translation only: " + category,
-        temperature=0.2,
-    )
-
-
 def ask_gemini_vision(image: bytes, prompt: str, as_json: bool = False):
     """Вопрос Gemini про картинку. None — Gemini недоступен или ответил непонятно."""
-    if gemini_client is None:
+    config = genai_types.GenerateContentConfig(
+        temperature=0, response_mime_type="application/json" if as_json else None)
+    text = gemini_generate([genai_types.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt], config)
+    if text is None:
         return None
-    try:
-        config = genai_types.GenerateContentConfig(
-            temperature=0, response_mime_type="application/json" if as_json else None)
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[genai_types.Part.from_bytes(data=image, mime_type="image/jpeg"), prompt],
-            config=config,
-        )
-        text = (response.text or "").strip()
-        return json.loads(text) if as_json else text
-    except Exception:
-        logger.exception("Ошибка Gemini (картинка)")
-        return None
+    return parse_json(text) if as_json else text
 
 
-def detect_gender(photo: bytes) -> Optional[str]:
-    """Пол человека на фото — иначе модель по «воинскому» промпту рисует мужское тело с женским лицом."""
-    answer = ask_gemini_vision(photo, "Is the main person in this photo a woman or a man? "
-                                      "Reply with exactly one word: female or male.")
-    answer = (answer or "").strip().lower()
-    return answer if answer in ("female", "male") else None
+def detect_gender_and_role(photo: bytes, category: str) -> tuple[Optional[str], Optional[str]]:
+    """Пол по фото и перевод класса — одним запросом, чтобы экономить бесплатный лимит Gemini."""
+    answer = ask_gemini_vision(
+        photo,
+        "1) Is the main person in this photo a woman or a man? "
+        f"2) Translate this fantasy character class into English, 1-4 words: «{category}». "
+        'Reply as JSON {"gender": "female" or "male", "role": "<english class>"}.',
+        as_json=True,
+    )
+    if not isinstance(answer, dict):
+        return None, None
+    gender = str(answer.get("gender", "")).strip().lower()
+    role = str(answer.get("role", "")).strip() or None
+    if role and CYRILLIC.search(role):
+        role = None
+    return (gender if gender in ("female", "male") else None), role
 
 
 def as_jpeg(image: bytes) -> bytes:
@@ -2377,8 +2417,7 @@ def generate_card(chat_id: int, data: dict, mode: str):
     def job(status):
         photo = download_telegram_file(data["photo_id"])
         reference = to_data_uri(photo, data["photo_mime"])
-        role = translate_role(data.get("category", ""))
-        gender = detect_gender(as_jpeg(photo))
+        gender, role = detect_gender_and_role(as_jpeg(photo), data.get("category", ""))
         logger.info("Генерация для %s: пол %s", chat_id, gender)
         art = fal_with_retry(FAL_GENERATE_ENDPOINT, lambda: {
             "prompt": build_art_prompt(data, role, gender),
