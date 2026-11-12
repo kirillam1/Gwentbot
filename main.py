@@ -106,8 +106,8 @@ busy_users: set[int] = set()
     STATE_FRAME, STATE_ABILITY, STATE_QUOTE, STATE_CONFIRM, STATE_SPIRITS,
     STATE_EDIT_PROMPT, STATE_EDIT_CONFIRM, STATE_TOPUP_AMOUNT,
     STATE_ADMIN_FIND, STATE_ADMIN_BALANCE, STATE_ADMIN_BROADCAST, STATE_ADMIN_BROADCAST_CONFIRM,
-    STATE_PROMO, STATE_ADMIN_PROMO, STATE_ADMIN_SCENE,
-) = range(23)
+    STATE_PROMO, STATE_ADMIN_PROMO, STATE_ADMIN_SCENE, STATE_ADMIN_MODELTEST,
+) = range(24)
 
 @dataclass(frozen=True)
 class Faction:
@@ -2202,6 +2202,71 @@ def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str]) -> 
     )
 
 
+# ---------- модели для артов ----------
+# PuLID (FLUX.1) заточен под перенос лица, но руки и предметы рисует хуже новых моделей.
+# FLUX.2 [pro] и Nano Banana 2 берут фото как образец и рисуют по описанию; лицо держат хуже/лучше —
+# поэтому модель выбирается в админке после сравнения на реальных фото.
+IDENTITY_PREFIX = (
+    "Paint a brand-new dark fantasy portrait of the person from the reference photo. "
+    "Keep their exact facial identity so they are clearly recognizable: face shape, eyes, eyebrows, nose, lips, "
+    "jawline, hairline, skin tone and apparent age. Do NOT copy the photo's clothes, background, lighting, "
+    "camera angle or framing; do not include the photo itself. "
+)
+ART_MODELS = {
+    "pulid": ("FLUX.1 PuLID", "~$0.03", FAL_GENERATE_ENDPOINT),
+    "flux2": ("FLUX.2 [pro]", "~$0.03–0.05", "https://queue.fal.run/fal-ai/flux-2-pro/edit"),
+    "nb2": ("Nano Banana 2", "~$0.08", "https://queue.fal.run/fal-ai/nano-banana-2/edit"),
+}
+ART_MODEL_FILE = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "art_model.txt")
+
+
+def current_art_model() -> str:
+    try:
+        with open(ART_MODEL_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+    except OSError:
+        key = os.getenv("ART_MODEL", "pulid")
+    return key if key in ART_MODELS else "pulid"
+
+
+def set_art_model(key: str):
+    with open(ART_MODEL_FILE, "w", encoding="utf-8") as f:
+        f.write(key)
+
+
+def art_payload(model: str, prompt: str, photo: bytes, mime: str, photo_url: Optional[str]) -> dict:
+    seed = random.randint(1, 2 ** 31 - 1)
+    if model == "pulid":
+        return {
+            "prompt": prompt,
+            "negative_prompt": ART_NEGATIVE,
+            "reference_image_url": to_data_uri(photo, mime),
+            "image_size": "portrait_4_3",
+            "num_inference_steps": 30,
+            # 4.0 — компромисс: ниже даёт живее мазки, но портит анатомию.
+            "guidance_scale": 4.0,
+            "true_cfg": 1.0,
+            "id_weight": 0.8,
+            # Лицо подмешивается позже — у модели больше свободы на рисованный стиль (ценой части сходства).
+            "start_step": 4,
+            # По умолчанию промпт обрезается до 128 токенов, и описание фона терялось.
+            "max_sequence_length": "512",
+            "seed": seed,
+        }
+    ref = photo_url or to_data_uri(photo, mime)
+    if model == "flux2":
+        return {"prompt": IDENTITY_PREFIX + prompt, "image_urls": [ref], "image_size": "portrait_4_3",
+                "output_format": "jpeg", "safety_tolerance": "4", "seed": seed}
+    return {"prompt": IDENTITY_PREFIX + prompt, "image_urls": [ref], "aspect_ratio": "3:4", "resolution": "1K",
+            "num_images": 1, "output_format": "jpeg", "safety_tolerance": "4", "seed": seed}
+
+
+def generate_art(model: str, prompt: str, photo: bytes, mime: str) -> bytes:
+    """Арт выбранной моделью. Фото для новых моделей — ссылкой на Fal CDN (меньше запрос), иначе data URI."""
+    photo_url = fal_upload(photo, mime, "reference.jpg") if model != "pulid" else None
+    return fal_with_retry(ART_MODELS[model][2], lambda: art_payload(model, prompt, photo, mime, photo_url))
+
+
 def status_ticker(chat_id: int, status, stop: threading.Event):
     """Раз в 10–15 секунд меняет фразу ожидания, чтобы было видно, что Лавк не завис."""
     last = None
@@ -2420,25 +2485,10 @@ def as_jpeg(image: bytes) -> bytes:
 def generate_card(chat_id: int, data: dict, mode: str):
     def job(status):
         photo = download_telegram_file(data["photo_id"])
-        reference = to_data_uri(photo, data["photo_mime"])
         gender, role = detect_gender_and_role(as_jpeg(photo), data.get("category", ""))
-        logger.info("Генерация для %s: пол %s", chat_id, gender)
-        art = fal_with_retry(FAL_GENERATE_ENDPOINT, lambda: {
-            "prompt": build_art_prompt(data, role, gender),
-            "negative_prompt": ART_NEGATIVE,
-            "reference_image_url": reference,
-            "image_size": "portrait_4_3",
-            "num_inference_steps": 30,
-            # 4.0 — компромисс: ниже даёт живее мазки, но портит анатомию.
-            "guidance_scale": 4.0,
-            "true_cfg": 1.0,
-            "id_weight": 0.8,
-            # Лицо подмешивается позже — у модели больше свободы на рисованный стиль (ценой части сходства).
-            "start_step": 4,
-            # По умолчанию промпт обрезается до 128 токенов, и описание фона терялось.
-            "max_sequence_length": "512",
-            "seed": random.randint(1, 2 ** 31 - 1),
-        })
+        model = current_art_model()
+        logger.info("Генерация для %s: пол %s, модель %s", chat_id, gender, model)
+        art = generate_art(model, build_art_prompt(data, role, gender), photo, data["photo_mime"])
         logger.info("Арт для %s нарисован", chat_id)
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
@@ -2659,8 +2709,67 @@ def admin_panel_markup():
     )
     markup.add(types.InlineKeyboardButton("🔎 Найти бойца", callback_data="adm:find"),
                types.InlineKeyboardButton("🎟 Промокоды", callback_data="adm:promo"))
-    markup.add(types.InlineKeyboardButton("🎨 Картинки Лавка", callback_data="adm:scenes"))
+    markup.add(types.InlineKeyboardButton("🎨 Картинки Лавка", callback_data="adm:scenes"),
+               types.InlineKeyboardButton("🧪 Модель артов", callback_data="adm:models"))
     return markup
+
+
+def show_models(chat_id: int):
+    active = current_art_model()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(*[types.InlineKeyboardButton(("✅ " if key == active else "▫️ ") + f"{title} · {price}",
+                                            callback_data=f"adm:model:{key}")
+                 for key, (title, price, _) in ART_MODELS.items()])
+    markup.add(types.InlineKeyboardButton("🧪 Сравнить все на моём фото", callback_data="adm:modeltest"))
+    bot.send_message(
+        chat_id,
+        f"🧪 <b>Модель для новых картищ:</b> {ART_MODELS[active][0]}\n\n"
+        "• <b>FLUX.1 PuLID</b> — лучше всех переносит лицо, но путается в руках и предметах.\n"
+        "• <b>FLUX.2 [pro]</b> — новое поколение FLUX: чище руки, детали и свет, цена почти та же.\n"
+        "• <b>Nano Banana 2</b> (Google) — хорошо держит внешность и понимает описание, дороже.\n\n"
+        "<i>Правки картищ остаются на FLUX Kontext. Сначала сравни на своём фото, потом выбери.</i>",
+        reply_markup=markup,
+    )
+
+
+def run_model_test(chat_id: int, photo: bytes, mime: str):
+    """Один и тот же персонаж всеми моделями — чтобы сравнить сходство, руки и детали."""
+    key = random.choice(list(FACTIONS))
+    data = {"faction_key": key, "faction": FACTIONS[key].name}
+    gender, _ = detect_gender_and_role(as_jpeg(photo), "")
+    prompt = build_art_prompt(data, None, gender)
+    status = bot.send_message(chat_id, f"🧪 Рисую всеми моделями: {FACTIONS[key].name}, пол {gender or '?'}… "
+                                       "Обычно 30–90 секунд.")
+
+    def one(model):
+        started = time.monotonic()
+        try:
+            return model, generate_art(model, prompt, photo, mime), time.monotonic() - started
+        except Exception as e:
+            logger.warning("Тест модели %s: %s", model, e)
+            return model, None, str(e)
+
+    with ThreadPoolExecutor(max_workers=len(ART_MODELS)) as pool:
+        results = list(pool.map(one, ART_MODELS))
+    safe_call(bot.delete_message, chat_id, status.message_id)
+    media, failed = [], []
+    for model, art, info in results:
+        title = ART_MODELS[model][0]
+        if art is None:
+            failed.append(f"❌ {title}: {esc(str(info)[:200])}")
+            continue
+        media.append(types.InputMediaPhoto(photo_source(art, f"test_{model}.jpg"),
+                                           caption=f"{title} · {ART_MODELS[model][1]} · {info:.0f} с"))
+    if media:
+        try:
+            bot.send_media_group(chat_id, media, timeout=MEDIA_TIMEOUT)
+        except Exception:
+            logger.exception("Не удалось отправить сравнение моделей")
+            failed.append("⚠️ Telegram не принял картинки — попробуй ещё раз.")
+    bot.send_message(chat_id, "\n".join(failed + ["Выбери модель для всех новых картищ:"]),
+                     reply_markup=types.InlineKeyboardMarkup(row_width=1).add(
+                         *[types.InlineKeyboardButton(title, callback_data=f"adm:model:{k}")
+                           for k, (title, _, _) in ART_MODELS.items()]))
 
 
 _scene_job = threading.Lock()
@@ -2856,6 +2965,21 @@ def cb_admin(call):
         show_promos(chat_id)
     elif action == "scenes":
         show_scenes(chat_id)
+    elif action == "models":
+        show_models(chat_id)
+    elif action == "model" and len(parts) == 3 and parts[2] in ART_MODELS:
+        try:
+            set_art_model(parts[2])
+        except OSError:
+            logger.exception("Не удалось сохранить выбор модели")
+            bot.send_message(chat_id, "⚠️ Не получилось сохранить выбор.")
+            return
+        logger.info("Модель артов: %s", parts[2])
+        bot.send_message(chat_id, f"✅ Новые картищи рисует <b>{ART_MODELS[parts[2]][0]}</b>.")
+    elif action == "modeltest":
+        user_states[chat_id] = STATE_ADMIN_MODELTEST
+        bot.send_message(chat_id, f"📸 Пришли фото человека — нарисую его всеми {len(ART_MODELS)} моделями "
+                                  "(≈$0.15 с Fal).", reply_markup=get_cancel_menu())
     elif action in ("scenesmissing", "scenesall"):
         keys = [k for k in SCENES if action == "scenesall" or not os.path.exists(scene_path(k))]
         if not keys:
@@ -3005,6 +3129,30 @@ def admin_promo(message):
 
 
 @bot.message_handler(content_types=["photo", "document", "text"],
+                     func=lambda msg: user_states.get(msg.chat.id) == STATE_ADMIN_MODELTEST and is_admin(msg.from_user.id))
+def admin_model_test(message):
+    chat_id = message.chat.id
+    if message.photo:
+        file_id, mime = message.photo[-1].file_id, "image/jpeg"
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id, mime = message.document.file_id, message.document.mime_type
+    else:
+        bot.send_message(chat_id, "⚠️ Нужно фото. Пришли его или жми «Отмена».")
+        return
+    reset_user(chat_id)
+    bot.send_message(chat_id, "👌 Принял.", reply_markup=get_main_menu(chat_id))
+
+    def job():
+        try:
+            run_model_test(chat_id, download_telegram_file(file_id), mime)
+        except Exception:
+            logger.exception("Сравнение моделей упало")
+            safe_call(bot.send_message, chat_id, "⚠️ Сравнение не удалось, смотри лог.")
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+@bot.message_handler(content_types=["photo", "document", "text"],
                      func=lambda msg: user_states.get(msg.chat.id) == STATE_ADMIN_SCENE and is_admin(msg.from_user.id))
 def admin_scene_upload(message):
     chat_id = message.chat.id
@@ -3082,7 +3230,7 @@ def fallback_handler(message):
         bot.send_message(chat_id, "👆 Выбери вариант кнопкой выше, человече.")
     elif state == STATE_PHOTO:
         bot.send_message(chat_id, "⚠️ Лавк просил картинку! Пришли фото, человече.")
-    elif state == STATE_ADMIN_SCENE:
+    elif state in (STATE_ADMIN_SCENE, STATE_ADMIN_MODELTEST):
         bot.send_message(chat_id, "⚠️ Нужна картинка. Пришли фото или жми «Отмена».")
     elif state in STEPS or state in (STATE_EDIT_PROMPT, STATE_TOPUP_AMOUNT, STATE_PROMO, STATE_ADMIN_PROMO):
         bot.send_message(chat_id, "⚠️ Лавк ждёт текст!")
