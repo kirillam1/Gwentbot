@@ -9,7 +9,9 @@ import re
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from typing import Callable, Optional
 from urllib.parse import quote
@@ -794,9 +796,16 @@ def warm_scenes():
                 uploaded = False
                 for admin_id in ADMIN_IDS:
                     try:
-                        msg = bot.send_photo(admin_id, photo_source(scene_upload_bytes(src), "scene.jpg"),
-                                             disable_notification=True,
-                                             timeout=SCENE_UPLOAD_TIMEOUT)
+                        raw = scene_upload_bytes(src)
+                        source = photo_source(raw, "scene.jpg")
+                        try:
+                            msg = bot.send_photo(admin_id, source, disable_notification=True,
+                                                 timeout=SCENE_UPLOAD_TIMEOUT)
+                        except apihelper.ApiTelegramException as e:
+                            if not isinstance(source, str) or not is_url_fetch_error(e):
+                                raise
+                            msg = bot.send_photo(admin_id, raw, disable_notification=True,
+                                                 timeout=SCENE_UPLOAD_TIMEOUT)
                     except Exception as e:
                         logger.warning("Не удалось загрузить картинку %s через админа %s: %s", src, admin_id, e)
                         continue
@@ -1734,8 +1743,15 @@ def cb_deck(call):
         # Доставка не была подтверждена — собираем карту заново из сохранённого арта.
         with RENDER_LOCK:
             full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")))
-        msg = tg_retry(bot.send_photo, chat_id, photo_source(full), caption=caption, reply_markup=markup,
-                       timeout=MEDIA_TIMEOUT)
+        src = photo_source(full)
+        try:
+            msg = tg_retry(bot.send_photo, chat_id, src, caption=caption, reply_markup=markup,
+                           timeout=MEDIA_TIMEOUT)
+        except apihelper.ApiTelegramException as e:
+            if not isinstance(src, str) or not is_url_fetch_error(e):
+                raise
+            msg = tg_retry(bot.send_photo, chat_id, full, caption=caption, reply_markup=markup,
+                           timeout=MEDIA_TIMEOUT)
         db.set_card_file(card["id"], msg.photo[-1].file_id)
         return
 
@@ -1959,34 +1975,75 @@ def fal_with_retry(endpoint: str, make_payload: Callable[[], dict]) -> bytes:
         return request_fal_image(endpoint, make_payload())
 
 
-def fal_upload(data: bytes, content_type: str = "image/jpeg", name: str = "card.jpg") -> Optional[str]:
-    """Кладёт файл в хранилище Fal и возвращает публичную ссылку. None — не вышло.
+FAL_CDN_URL = "https://v3.fal.media"
+_fal_token = {"value": "", "expires": 0.0}
+_fal_token_lock = threading.Lock()
+_fal_upload_off_until = 0.0  # после сбоя не тратим время на загрузку, сразу шлём байты
 
-    Канал Amvera → Telegram очень медленный, а до Fal быстрый. Если дать Telegram ссылку,
+
+def _fal_cdn_auth() -> str:
+    """Короткоживущий токен Fal CDN v3 — тот же путь, что у официального fal_client."""
+    with _fal_token_lock:
+        if _fal_token["value"] and time.time() < _fal_token["expires"] - 60:
+            return _fal_token["value"]
+        r = requests.post(
+            "https://rest.fal.ai/storage/auth/token?storage_type=fal-cdn-v3",
+            json={},
+            headers={"Authorization": f"Key {FAL_KEY}", "Accept": "application/json",
+                     "Content-Type": "application/json"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        try:
+            expires = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError, AttributeError):
+            expires = time.time() + 600
+        _fal_token["value"] = f"{data['token_type']} {data['token']}"
+        _fal_token["expires"] = expires
+        return _fal_token["value"]
+
+
+def fal_upload(data: bytes, content_type: str = "image/jpeg", name: str = "card.jpg") -> Optional[str]:
+    """Кладёт файл в Fal CDN и возвращает публичную ссылку. None — не вышло.
+
+    Канал Amvera → Telegram медленный, а до Fal быстрый. Если дать Telegram ссылку,
     он сам скачает картинку с Fal, и с Amvera уйдёт только короткий запрос.
     """
-    if not FAL_KEY:
+    global _fal_upload_off_until
+    if not FAL_KEY or time.time() < _fal_upload_off_until:
         return None
+    started = time.monotonic()
     try:
-        init = requests.post(
-            "https://rest.fal.ai/storage/upload/initiate?storage_type=gcs",
-            json={"file_name": name, "content_type": content_type},
-            headers={"Authorization": f"Key {FAL_KEY}", "Accept": "application/json"},
-            timeout=20,
+        r = requests.post(
+            f"{FAL_CDN_URL}/files/upload",
+            data=data,
+            headers={"Authorization": _fal_cdn_auth(), "Content-Type": content_type,
+                     "X-Fal-File-Name": name},
+            timeout=(10, 40),
         )
-        init.raise_for_status()
-        info = init.json()
-        put = requests.put(info["upload_url"], data=data, headers={"Content-Type": content_type}, timeout=60)
-        put.raise_for_status()
-        return info["file_url"]
+        if r.status_code in (401, 403):
+            with _fal_token_lock:
+                _fal_token["value"] = ""
+        r.raise_for_status()
+        url = r.json()["access_url"]
+        logger.info("Картинка %s выложена на Fal за %.1f с", name, time.monotonic() - started)
+        return url
     except Exception as e:
-        logger.warning("Не удалось выложить картинку на Fal: %s", e)
+        _fal_upload_off_until = time.time() + 600
+        logger.warning("Не удалось выложить картинку на Fal (%s) — 10 минут шлю байтами", e)
         return None
 
 
 def photo_source(data: bytes, name: str = "card.jpg"):
     """Ссылка на картинку (если удалось выложить на Fal) или сами байты как запасной путь."""
     return fal_upload(data, name=name) or data
+
+
+def is_url_fetch_error(e: Exception) -> bool:
+    """Telegram не смог скачать картинку по ссылке — тогда отправляем байты."""
+    return (isinstance(e, apihelper.ApiTelegramException) and e.error_code == 400
+            and any(k in str(e).lower() for k in ("http url", "url content", "wrong file", "webpage_", "failed to get")))
 
 
 def tg_retry(func, *args, attempts: int = 3, **kwargs):
@@ -2215,10 +2272,21 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
     started = time.monotonic()
     try:
-        sent = tg_retry(bot.send_media_group, chat_id, [
-            types.InputMediaPhoto(photo_source(full, "card_full.jpg"), caption=caption, parse_mode="HTML"),
-            types.InputMediaPhoto(photo_source(card_only, "card_frame.jpg")),
-        ], timeout=MEDIA_TIMEOUT)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            sources = list(pool.map(lambda a: photo_source(*a),
+                                    [(full, "card_full.jpg"), (card_only, "card_frame.jpg")]))
+
+        def media(srcs):
+            return [types.InputMediaPhoto(srcs[0], caption=caption, parse_mode="HTML"),
+                    types.InputMediaPhoto(srcs[1])]
+
+        try:
+            sent = tg_retry(bot.send_media_group, chat_id, media(sources), timeout=MEDIA_TIMEOUT)
+        except apihelper.ApiTelegramException as e:
+            if not any(isinstance(x, str) for x in sources) or not is_url_fetch_error(e):
+                raise
+            logger.warning("Telegram не скачал карту по ссылке Fal (%s) — отправляю байтами", e)
+            sent = tg_retry(bot.send_media_group, chat_id, media([full, card_only]), timeout=MEDIA_TIMEOUT)
         file_id = sent[0].photo[-1].file_id
         logger.info("Карта для %s отправлена в Telegram за %.0f с", chat_id, time.monotonic() - started)
     except requests.ReadTimeout:
