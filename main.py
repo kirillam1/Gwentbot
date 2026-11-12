@@ -766,6 +766,12 @@ _warm_lock = threading.Lock()
 _warm_pending = threading.Event()
 
 
+def scenes_warming() -> bool:
+    """True, пока не все картинки экранов загружены в Telegram (первые минуты после пересборки)."""
+    sources = {scene_source(k) for k in list(SCENES) + ["welcome"]} - {None}
+    return any(not cached_scene_id(src) for src in sources)
+
+
 def warm_scenes_async():
     _warm_pending.set()
     if not _warm_lock.locked():
@@ -1166,6 +1172,9 @@ def show_welcome(chat_id: int):
     )
     if has_trial(chat_id) and not is_free(chat_id):
         text += "\n\n🎁 <b>Первая картища — в подарок!</b> Жми «Создать карту»."
+    if scenes_warming():
+        text += ("\n\n🕯 <i>Лавк только проснулся и развешивает картины по пещере — первые минуты часть экранов "
+                 "может прийти без картинок. Бот при этом работает как обычно!</i>")
     send_screen(chat_id, "welcome", text, reply_markup=get_main_menu(chat_id))
 
 
