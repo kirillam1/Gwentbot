@@ -49,6 +49,7 @@ FAL_GENERATE_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pulid"
 FAL_EDIT_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/kontext"
 FAL_MASK_ENDPOINT = "https://queue.fal.run/fal-ai/birefnet/v2"
 FAL_FILL_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/v1/fill"
+FAL_SAFETY = "4"   # фильтр Fal для правок: 1 — строже всего, 6 — мягче; по умолчанию 2 бракует мрачное фэнтези
 FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
 GEMINI_TIMEOUT_MS = 30_000
 
@@ -679,24 +680,70 @@ def is_photo(message) -> bool:
     return getattr(message, "content_type", None) == "photo"
 
 
+SCENE_CACHE = os.path.join(SCENE_DIR, "file_ids.json")
+SCENE_TIMEOUT = 20          # секунд на отправку картинки экрана, дальше — просто текст
+SCENE_COOLDOWN = 600        # после сбоя загрузки картинка экрана не пробуется 10 минут
+_scene_failed: dict[str, float] = {}
+
+
+def _load_scene_cache():
+    try:
+        with open(SCENE_CACHE, encoding="utf-8") as f:
+            return {tuple(json.loads(k)): v for k, v in json.load(f).items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_scene_cache():
+    try:
+        os.makedirs(SCENE_DIR, exist_ok=True)
+        tmp = SCENE_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({json.dumps(list(k)): v for k, v in _scene_file_ids.items()}, f)
+        os.replace(tmp, SCENE_CACHE)
+    except OSError:
+        logger.exception("Не удалось сохранить кэш картинок экранов")
+
+
+def scene_upload_bytes(src: str) -> bytes:
+    """Картинка экрана для загрузки: до 960 px и ~100–150 КБ — быстро даже по медленному каналу до Telegram."""
+    with Image.open(src) as img:
+        img = img.convert("RGB")
+        img.thumbnail((960, 960), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=82, optimize=True)
+        return out.getvalue()
+
+
 def send_screen(chat_id: int, key: str, text: str, reply_markup=None):
     """Экран с картинкой Лавка сверху. Без картинки или при ошибке — просто текст."""
     src = scene_source(key)
-    if src is None:
+    if src is None or time.monotonic() - _scene_failed.get(src, -SCENE_COOLDOWN) < SCENE_COOLDOWN:
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
-    cache_key = (src, os.path.getmtime(src))
+    # file_id Telegram хранится в /data: после пересборки картинки не загружаются заново.
+    cache_key = (src, int(os.path.getmtime(src)))
     long_text = len(text) > CAPTION_LIMIT
     caption, markup = (None, None) if long_text else (text, reply_markup)
     try:
-        if cache_key in _scene_file_ids:
-            msg = bot.send_photo(chat_id, _scene_file_ids[cache_key], caption=caption, reply_markup=markup)
+        with _scene_lock:
+            if not _scene_file_ids:
+                _scene_file_ids.update(_load_scene_cache())
+            file_id = _scene_file_ids.get(cache_key)
+        if file_id:
+            msg = bot.send_photo(chat_id, file_id, caption=caption, reply_markup=markup, timeout=SCENE_TIMEOUT)
         else:
-            with open(src, "rb") as photo:
-                msg = bot.send_photo(chat_id, photo, caption=caption, reply_markup=markup)
-            _scene_file_ids[cache_key] = msg.photo[-1].file_id
+            msg = bot.send_photo(chat_id, scene_upload_bytes(src), caption=caption, reply_markup=markup,
+                                 timeout=SCENE_TIMEOUT)
+            with _scene_lock:
+                _scene_file_ids[cache_key] = msg.photo[-1].file_id
+                _save_scene_cache()
     except (apihelper.ApiTelegramException, OSError) as e:
         logger.warning("Картинка экрана %s не отправилась: %s", key, e)
-        _scene_file_ids.pop(cache_key, None)
+        with _scene_lock:
+            if _scene_file_ids.pop(cache_key, None):
+                _save_scene_cache()
+        if not isinstance(e, apihelper.ApiTelegramException):
+            _scene_failed[src] = time.monotonic()
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
     if long_text:
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
@@ -769,23 +816,43 @@ bot.setup_middleware(AccessMiddleware())
 # ==========================================
 # 4. ГЕНЕРАЦИЯ ПОЛЕЙ (Gemini / случайные числа)
 # ==========================================
-def ask_gemini(prompt: str, keep_markup: bool = False, temperature: float = 1.2) -> Optional[str]:
+def gemini_raw(prompt, temperature: float, json_mode: bool = False, attempts: int = 2) -> Optional[str]:
+    """Текст ответа Gemini с повтором (лимиты и сбои сети бывают часто). None — не вышло."""
     if gemini_client is None:
         return None
+    config = genai_types.GenerateContentConfig(
+        temperature=temperature, response_mime_type="application/json" if json_mode else None)
+    for attempt in range(1, attempts + 1):
+        try:
+            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+            text = (response.text or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            logger.warning("Ошибка Gemini (попытка %s/%s): %s", attempt, attempts, e)
+        if attempt < attempts:
+            time.sleep(2 * attempt)
+    return None
+
+
+def ask_gemini(prompt: str, keep_markup: bool = False, temperature: float = 1.2) -> Optional[str]:
+    text = gemini_raw(prompt, temperature)
+    if text is None:
+        return None
+    text = text.strip('"«»')
+    text = text.replace("**", "*") if keep_markup else text.replace("*", "")
+    return text or None
+
+
+def parse_json(text: Optional[str]):
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
     try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(temperature=temperature),
-        )
-        text = (response.text or "").strip().strip('"«»')
-        if keep_markup:
-            text = text.replace("**", "*")
-        else:
-            text = text.replace("*", "")
-        return text or None
-    except Exception:
-        logger.exception("Ошибка Gemini")
+        return json.loads(text)
+    except ValueError:
         return None
 
 
@@ -2169,25 +2236,34 @@ HANDS_OK = "Any visible hands are anatomically correct, with five fingers each."
 EDIT_STYLE = "Hand-painted GWENT card art style, painterly brush strokes."
 
 
+CYRILLIC = re.compile(r"[а-яё]", re.IGNORECASE)
+
+
+def translate_edit(request: str, kind: str) -> str:
+    """Запасной путь: простой перевод правки на английский (модели правок русского не понимают)."""
+    task = ("Describe this new background scenery in English in one or two sentences, without any person"
+            if kind == "background" else
+            "Translate this image edit request into one clear English instruction for an image editing model")
+    english = ask_gemini(f"{task}. Reply with the English text only.\n\n{request}", temperature=0.2)
+    if english and not CYRILLIC.search(english):
+        return english
+    logger.error("Правка не переведена, отправляю как есть: %r", request)
+    return english or request
+
+
 def classify_edit(request: str) -> tuple[str, str]:
-    answer = None
-    if gemini_client is not None:
-        try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL, contents=EDIT_CLASSIFY + request,
-                config=genai_types.GenerateContentConfig(temperature=0.3, response_mime_type="application/json"),
-            )
-            answer = json.loads(response.text or "{}")
-        except Exception:
-            logger.exception("Ошибка Gemini (разбор правки)")
-    if isinstance(answer, dict) and answer.get("kind") in ("background", "face", "other") and answer.get("instruction"):
+    answer = parse_json(gemini_raw(EDIT_CLASSIFY + request, temperature=0.3, json_mode=True))
+    if (isinstance(answer, dict) and answer.get("kind") in ("background", "face", "other")
+            and answer.get("instruction") and not CYRILLIC.search(str(answer["instruction"]))):
         return answer["kind"], str(answer["instruction"])
     low = request.lower()
     if any(w in low for w in FACE_WORDS):
-        return "face", request
-    if any(w in low for w in BG_WORDS):
-        return "background", request
-    return "other", request
+        kind = "face"
+    elif any(w in low for w in BG_WORDS):
+        kind = "background"
+    else:
+        kind = "other"
+    return kind, translate_edit(request, kind)
 
 
 def fal_image_url(body: dict) -> str:
@@ -2252,6 +2328,8 @@ def replace_background(source: bytes, scene: str) -> bytes:
         "image_url": uri,
         "mask_url": mask_uri,
         "output_format": "jpeg",
+        # 2 по умолчанию — слишком строго для мрачного фэнтези (кровь, кости); 4 — умеренно.
+        "safety_tolerance": FAL_SAFETY,
         "seed": random.randint(1, 2 ** 31 - 1),
     })
     return composite_subject(source, filled, mask)
@@ -2302,6 +2380,7 @@ def edit_with_identity(source: bytes, instruction: str, restore: bool) -> bytes:
     edited = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
         "prompt": f"{instruction} {keep} {HANDS_OK} {EDIT_STYLE}",
         "image_url": uri, "aspect_ratio": "3:4", "guidance_scale": 3.5, "output_format": "jpeg",
+        "safety_tolerance": FAL_SAFETY,
     })
     return restore_face(source, edited) if restore else edited
 
