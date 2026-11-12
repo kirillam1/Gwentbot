@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -2967,7 +2968,40 @@ def fallback_handler(message):
                     reply_markup=get_main_menu(chat_id))
 
 
+def check_telegram_network():
+    """Замер связи с Telegram при запуске; при сломанном IPv6 переключает запросы на IPv4.
+
+    Если у сервера есть IPv6-адрес, но маршрут до Telegram по нему не работает, каждое новое соединение
+    сначала ждёт таймаут IPv6 и лишь потом идёт по IPv4 — это даёт задержки по 10–20 с на ровном месте.
+    """
+    host = "api.telegram.org"
+    timings = {}
+    for family, name in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6")):
+        try:
+            address = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)[0][4][0]
+            started = time.monotonic()
+            with socket.create_connection((address, 443), timeout=5):
+                timings[name] = time.monotonic() - started
+        except OSError as e:
+            timings[name] = None
+            logger.info("Telegram по %s недоступен: %s", name, e)
+    v4, v6 = timings.get("IPv4"), timings.get("IPv6")
+    logger.info("Связь с Telegram: IPv4 %s, IPv6 %s", f"{v4:.2f} с" if v4 is not None else "нет",
+                f"{v6:.2f} с" if v6 is not None else "нет")
+    if v4 is not None and (v6 is None or v6 > v4 + 0.5):
+        import urllib3.util.connection as urllib3_connection
+        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+        logger.info("Запросы к внешним сервисам идут только по IPv4")
+    started = time.monotonic()
+    try:
+        bot.get_me()
+        logger.info("Запрос к Telegram API занял %.2f с", time.monotonic() - started)
+    except Exception as e:
+        logger.warning("Запрос к Telegram API не прошёл: %s", e)
+
+
 if __name__ == "__main__":
+    check_telegram_network()
     logger.info("Lavk is listening as @%s...", bot_username())
     # Картинки экранов загружаются в Telegram заранее, в фоне — пользователи их не ждут.
     warm_scenes_async()
