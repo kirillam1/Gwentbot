@@ -681,9 +681,7 @@ def is_photo(message) -> bool:
 
 
 SCENE_CACHE = os.path.join(SCENE_DIR, "file_ids.json")
-SCENE_TIMEOUT = 20          # секунд на отправку картинки экрана, дальше — просто текст
-SCENE_COOLDOWN = 600        # после сбоя загрузки картинка экрана не пробуется 10 минут
-_scene_failed: dict[str, float] = {}
+SCENE_UPLOAD_TIMEOUT = 180  # фоновая загрузка картинки в Telegram (пользователь её не ждёт)
 
 
 def _load_scene_cache():
@@ -715,39 +713,94 @@ def scene_upload_bytes(src: str) -> bytes:
         return out.getvalue()
 
 
+def _scene_key(src: str) -> tuple:
+    return (src, int(os.path.getmtime(src)))
+
+
+def cached_scene_id(src: str) -> Optional[str]:
+    with _scene_lock:
+        if not _scene_file_ids:
+            _scene_file_ids.update(_load_scene_cache())
+        return _scene_file_ids.get(_scene_key(src))
+
+
+def forget_scene(src: str):
+    with _scene_lock:
+        if _scene_file_ids.pop(_scene_key(src), None):
+            _save_scene_cache()
+
+
 def send_screen(chat_id: int, key: str, text: str, reply_markup=None):
-    """Экран с картинкой Лавка сверху. Без картинки или при ошибке — просто текст."""
+    """Экран с картинкой Лавка сверху.
+
+    Картинка уходит только по file_id — это мгновенно. Пока картинка ещё не загружена в Telegram,
+    экран показывается текстом, а загрузка идёт в фоне через админа (warm_scenes). Так пользователь
+    не ждёт медленной загрузки и не получает один и тот же экран дважды.
+    """
     src = scene_source(key)
-    if src is None or time.monotonic() - _scene_failed.get(src, -SCENE_COOLDOWN) < SCENE_COOLDOWN:
+    file_id = cached_scene_id(src) if src else None
+    if not file_id:
+        if src:
+            warm_scenes_async()
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
-    # file_id Telegram хранится в /data: после пересборки картинки не загружаются заново.
-    cache_key = (src, int(os.path.getmtime(src)))
     long_text = len(text) > CAPTION_LIMIT
     caption, markup = (None, None) if long_text else (text, reply_markup)
     try:
-        with _scene_lock:
-            if not _scene_file_ids:
-                _scene_file_ids.update(_load_scene_cache())
-            file_id = _scene_file_ids.get(cache_key)
-        if file_id:
-            msg = bot.send_photo(chat_id, file_id, caption=caption, reply_markup=markup, timeout=SCENE_TIMEOUT)
-        else:
-            msg = bot.send_photo(chat_id, scene_upload_bytes(src), caption=caption, reply_markup=markup,
-                                 timeout=SCENE_TIMEOUT)
-            with _scene_lock:
-                _scene_file_ids[cache_key] = msg.photo[-1].file_id
-                _save_scene_cache()
-    except (apihelper.ApiTelegramException, OSError) as e:
+        msg = bot.send_photo(chat_id, file_id, caption=caption, reply_markup=markup)
+    except apihelper.ApiTelegramException as e:
+        # file_id устарел или не подходит — забываем его и показываем текст.
         logger.warning("Картинка экрана %s не отправилась: %s", key, e)
-        with _scene_lock:
-            if _scene_file_ids.pop(cache_key, None):
-                _save_scene_cache()
-        if not isinstance(e, apihelper.ApiTelegramException):
-            _scene_failed[src] = time.monotonic()
+        forget_scene(src)
+        warm_scenes_async()
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    except requests.ConnectionError:
+        # До Telegram запрос не дошёл — повтор текстом дубля не создаст.
+        return bot.send_message(chat_id, text, reply_markup=reply_markup)
+    # При ReadTimeout сообщение, скорее всего, уже доставлено — второй раз не шлём (ошибка уйдёт в лог).
     if long_text:
         return bot.send_message(chat_id, text, reply_markup=reply_markup)
     return msg
+
+
+_warm_lock = threading.Lock()
+_warm_pending = threading.Event()
+
+
+def warm_scenes_async():
+    _warm_pending.set()
+    if not _warm_lock.locked():
+        threading.Thread(target=warm_scenes, daemon=True).start()
+
+
+def warm_scenes():
+    """Загружает в Telegram картинки экранов, у которых ещё нет file_id, через чат админа."""
+    if not _warm_lock.acquire(blocking=False):
+        return
+    try:
+        while _warm_pending.is_set():
+            _warm_pending.clear()
+            sources = {scene_source(k) for k in list(SCENES) + ["welcome"]} - {None}
+            for src in sorted(sources):
+                if cached_scene_id(src):
+                    continue
+                uploaded = False
+                for admin_id in ADMIN_IDS:
+                    try:
+                        msg = bot.send_photo(admin_id, scene_upload_bytes(src), disable_notification=True,
+                                             timeout=SCENE_UPLOAD_TIMEOUT)
+                    except Exception as e:
+                        logger.warning("Не удалось загрузить картинку %s через админа %s: %s", src, admin_id, e)
+                        continue
+                    with _scene_lock:
+                        _scene_file_ids[_scene_key(src)] = msg.photo[-1].file_id
+                        _save_scene_cache()
+                    safe_call(bot.delete_message, admin_id, msg.message_id)
+                    uploaded = True
+                    break
+                if not uploaded:
+                    logger.warning("Картинка %s пока без file_id — экраны с ней идут текстом", src)
+    finally:
+        _warm_lock.release()
 
 
 def edit_screen(chat_id: int, message, text: str, reply_markup=None):
@@ -779,6 +832,7 @@ def draw_scene(key: str) -> None:
     with open(tmp, "wb") as f:
         f.write(art)
     os.replace(tmp, scene_path(key))
+    warm_scenes_async()
 
 # ==========================================
 # 3. ДОСТУП: только личка, блокировка, учёт пользователей
@@ -2773,6 +2827,7 @@ def admin_scene_upload(message):
         with Image.open(io.BytesIO(download_telegram_file(file_id))) as img:
             os.makedirs(SCENE_DIR, exist_ok=True)
             img.convert("RGB").save(scene_path(key), "JPEG", quality=92)
+        warm_scenes_async()
     except Exception:
         logger.exception("Не удалось сохранить картинку экрана %s", key)
         bot.send_message(chat_id, "⚠️ Не получилось прочитать картинку. Попробуй другую.")
@@ -2847,6 +2902,8 @@ def fallback_handler(message):
 
 if __name__ == "__main__":
     logger.info("Lavk is listening as @%s...", bot_username())
+    # Картинки экранов загружаются в Telegram заранее, в фоне — пользователи их не ждут.
+    warm_scenes_async()
     bot.infinity_polling(
         timeout=60,
         long_polling_timeout=30,
