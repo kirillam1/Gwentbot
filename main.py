@@ -2046,26 +2046,40 @@ def is_url_fetch_error(e: Exception) -> bool:
             and any(k in str(e).lower() for k in ("http url", "url content", "wrong file", "webpage_", "failed to get")))
 
 
-def tg_retry(func, *args, attempts: int = 3, **kwargs):
-    """Повтор отправки в Telegram при флуд-лимите, 5xx и обрыве связи — чтобы готовая карта не терялась."""
+def not_sent(e: Exception) -> bool:
+    """Соединение не установилось — Telegram запрос точно не получил."""
+    if isinstance(e, requests.ConnectTimeout):
+        return True
+    text = repr(e)
+    return any(k in text for k in ("NewConnectionError", "NameResolutionError", "Failed to establish",
+                                   "Temporary failure in name resolution", "Connection refused"))
+
+
+def tg_retry(func, *args, attempts: int = 3, idempotent: bool = False, **kwargs):
+    """Повтор запроса к Telegram только там, где он не создаст дубль.
+
+    Обрыв после отправки («Connection aborted», 5xx) значит, что фото часто уже доставлено —
+    повтор отправки присылал человеку 2–3 одинаковые карты. Такие ошибки повторяем
+    только для безопасных запросов (idempotent=True), для отправок — пробрасываем.
+    """
     for attempt in range(1, attempts + 1):
         try:
             return func(*args, **kwargs)
         except apihelper.ApiTelegramException as e:
-            if attempt == attempts or (e.error_code != 429 and e.error_code < 500):
+            retryable = e.error_code == 429 or (idempotent and e.error_code >= 500)
+            if attempt == attempts or not retryable:
                 raise
             delay = int((e.result_json or {}).get("parameters", {}).get("retry_after", 3 * attempt))
-        except requests.ConnectionError:
-            # До сервера запрос не дошёл, повтор не создаст дубль.
-            if attempt == attempts:
+        except requests.ConnectionError as e:
+            if attempt == attempts or not (idempotent or not_sent(e)):
                 raise
             delay = 3 * attempt
-        logger.warning("Telegram: повтор %s через %s с", func.__name__, delay)
+        logger.warning("Telegram: повтор %s через %s с", getattr(func, "__name__", "запроса"), delay)
         time.sleep(delay)
 
 
 def download_telegram_file(file_id: str) -> bytes:
-    return tg_retry(lambda: bot.download_file(bot.get_file(file_id).file_path))
+    return tg_retry(lambda: bot.download_file(bot.get_file(file_id).file_path), idempotent=True)
 
 
 def refund(chat_id: int, price: int, mode: str) -> str:
@@ -2289,11 +2303,11 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
             sent = tg_retry(bot.send_media_group, chat_id, media([full, card_only]), timeout=MEDIA_TIMEOUT)
         file_id = sent[0].photo[-1].file_id
         logger.info("Карта для %s отправлена в Telegram за %.0f с", chat_id, time.monotonic() - started)
-    except requests.ReadTimeout:
-        # Файлы ушли, но Telegram не успел ответить — карта почти наверняка уже у человека.
+    except (requests.ReadTimeout, requests.ConnectionError) as e:
+        # Файлы ушли, но Telegram не успел ответить (или связь оборвалась) — карта почти наверняка уже у человека.
         # Не повторяем (будет дубль) и не возвращаем звёзды: сохраняем в колоду без file_id,
         # из «Моих картищ» она перерисуется из сохранённого арта.
-        logger.warning("Telegram не подтвердил доставку карты для %s вовремя", chat_id)
+        logger.warning("Telegram не подтвердил доставку карты для %s: %s", chat_id, e.__class__.__name__)
         file_id = ""
     safe_call(bot.delete_message, chat_id, status.message_id)
     card_id = db.add_card(chat_id, card_data, file_id, parent_id=parent_id)
