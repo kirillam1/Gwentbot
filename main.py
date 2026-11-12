@@ -52,6 +52,7 @@ FAL_FILL_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/v1/fill"
 FAL_SAFETY = "4"   # фильтр Fal для правок: 1 — строже всего, 6 — мягче; по умолчанию 2 бракует мрачное фэнтези
 FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
 GEMINI_TIMEOUT_MS = 30_000
+MEDIA_TIMEOUT = 300       # секунд на загрузку готовой карты в Telegram (канал бывает очень медленным)
 
 GENERATION_PRICE = 100
 EDIT_PRICE = 50
@@ -1724,7 +1725,15 @@ def cb_deck(call):
                    f"\n📅 {card['created_at'][:10]}")
         if card["data"].get("edit"):
             caption += f"\n✏️ Правка: {esc(card['data']['edit'])}"
-        bot.send_photo(chat_id, card["file_id"], caption=caption, reply_markup=card_markup(card, with_deck=True))
+        markup = card_markup(card, with_deck=True)
+        if card["file_id"]:
+            bot.send_photo(chat_id, card["file_id"], caption=caption, reply_markup=markup)
+            return
+        # Доставка не была подтверждена — собираем карту заново из сохранённого арта.
+        with RENDER_LOCK:
+            full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")))
+        msg = tg_retry(bot.send_photo, chat_id, full, caption=caption, reply_markup=markup, timeout=MEDIA_TIMEOUT)
+        db.set_card_file(card["id"], msg.photo[-1].file_id)
         return
 
     # action == "edit"
@@ -2169,14 +2178,25 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
     with RENDER_LOCK:
         full, card_only = render_card(art, card_data, trial=trial)
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
-    sent = tg_retry(bot.send_media_group, chat_id, [
-        types.InputMediaPhoto(full, caption=caption, parse_mode="HTML"),
-        types.InputMediaPhoto(card_only),
-    ])
+    try:
+        sent = tg_retry(bot.send_media_group, chat_id, [
+            types.InputMediaPhoto(full, caption=caption, parse_mode="HTML"),
+            types.InputMediaPhoto(card_only),
+        ], timeout=MEDIA_TIMEOUT)
+        file_id = sent[0].photo[-1].file_id
+    except requests.ReadTimeout:
+        # Файлы ушли, но Telegram не успел ответить — карта почти наверняка уже у человека.
+        # Не повторяем (будет дубль) и не возвращаем звёзды: сохраняем в колоду без file_id,
+        # из «Моих картищ» она перерисуется из сохранённого арта.
+        logger.warning("Telegram не подтвердил доставку карты для %s вовремя", chat_id)
+        file_id = ""
     safe_call(bot.delete_message, chat_id, status.message_id)
-    card_id = db.add_card(chat_id, card_data, sent[0].photo[-1].file_id, parent_id=parent_id)
+    card_id = db.add_card(chat_id, card_data, file_id, parent_id=parent_id)
     save_art(card_id, art)
     try:
+        if not file_id:
+            bot.send_message(chat_id, "📨 Telegram долго принимал картищу. Если она не пришла выше — "
+                                      "открой «📜 Мои картищи», она уже там.")
         if trial:
             note = ("🎁 <b>Это пробная картища</b> — поэтому на ней водяные знаки Лавка.\n"
                     f"Чистая картища без надписей — {GENERATION_PRICE}⭐. Пополни мешочек и закажи настоящую!")

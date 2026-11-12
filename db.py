@@ -233,6 +233,10 @@ class Database:
             )
             return cur.lastrowid
 
+    def set_card_file(self, card_id: int, file_id: str):
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE cards SET file_id = ? WHERE id = ?", (file_id, card_id))
+
     @staticmethod
     def _card(row):
         if row is None:

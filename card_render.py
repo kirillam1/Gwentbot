@@ -477,9 +477,17 @@ def watermark(img: Image.Image) -> Image.Image:
     return out
 
 
+# Telegram всё равно пережимает фото до 1280 px по длинной стороне — больше слать незачем,
+# а каждый лишний килобайт на медленном канале до Telegram стоит секунды.
+SEND_MAX_SIDE = 1280
+
+
 def to_jpeg(img: Image.Image) -> bytes:
+    img = img.convert("RGB")
+    if max(img.size) > SEND_MAX_SIDE:
+        img.thumbnail((SEND_MAX_SIDE, SEND_MAX_SIDE), Image.LANCZOS)
     out = io.BytesIO()
-    img.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
+    img.save(out, format="JPEG", quality=86, optimize=True, progressive=True)
     return out.getvalue()
 
 
