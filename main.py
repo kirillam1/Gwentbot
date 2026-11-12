@@ -58,7 +58,7 @@ FAL_MASK_ENDPOINT = "https://queue.fal.run/fal-ai/birefnet/v2"
 FAL_FILL_ENDPOINT = "https://queue.fal.run/fal-ai/flux-pro/v1/fill"
 FAL_SAFETY = "4"   # фильтр Fal для правок: 1 — строже всего, 6 — мягче; по умолчанию 2 бракует мрачное фэнтези
 FAL_DEADLINE = 200        # секунд на одну попытку генерации, потом отмена (и ещё одна попытка)
-GEMINI_TIMEOUT_MS = 30_000
+GEMINI_TIMEOUT_MS = 20_000  # обычный ответ — 1–8 с; дольше — модель перегружена, лучше взять следующую
 MEDIA_TIMEOUT = 300       # секунд на загрузку готовой карты в Telegram (канал бывает очень медленным)
 
 GENERATION_PRICE = 100
@@ -938,6 +938,10 @@ def gemini_generate(contents, config) -> Optional[str]:
                     break
                 if code in (400, 403):
                     logger.warning("Gemini %s отклонил запрос (%s): %s", model, code, str(e)[:200])
+                    break
+                if code == 504 or "timeout" in type(e).__name__.lower():
+                    # Модель не уложилась в таймаут — повтор потратит ещё столько же, сразу берём следующую.
+                    logger.warning("Gemini %s не ответил вовремя — пробую следующую модель", model)
                     break
                 logger.warning("Ошибка Gemini %s (попытка %s/2): %s", model, attempt, str(e)[:300])
                 if attempt == 1:
