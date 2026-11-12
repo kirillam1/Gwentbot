@@ -3001,7 +3001,8 @@ def check_telegram_network():
 
 
 if __name__ == "__main__":
-    check_telegram_network()
+    # В фоне: проверка сети не должна задерживать запуск бота, даже если DNS или Telegram отвечают медленно.
+    threading.Thread(target=check_telegram_network, daemon=True).start()
     logger.info("Lavk is listening as @%s...", bot_username())
     # Картинки экранов загружаются в Telegram заранее, в фоне — пользователи их не ждут.
     warm_scenes_async()
