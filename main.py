@@ -2188,17 +2188,23 @@ GENDER_TEXT = {
 }
 
 
-def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str]) -> str:
+def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str], sees_photo: bool = False) -> str:
     key = data.get("faction_key") or next((k for k, f in FACTIONS.items() if f.name == data.get("faction")), "Neutral")
     faction = FACTIONS.get(key, FACTIONS["Neutral"])
     male, female = ATTIRE.get(key, ATTIRE["Neutral"])
-    # Без пола — мужской вариант с явным «человек», как было раньше; с женским фото — женская одежда и фигура.
-    attire = random.choice(female if gender == "female" else male)
     role_text = f" Their trade: {role}." if role and len(role) <= 60 else ""
+    if sees_photo and not gender:
+        # Модель сама видит человека на фото — пол не определяем через Gemini, даём ей оба варианта одежды.
+        index = random.randrange(min(len(male), len(female)))
+        portrait = (f"Keep the person's real gender from the reference photo. Portrait of {male[index]} "
+                    f"(if the person is a woman: {female[index]})")
+    else:
+        # Без пола — мужской вариант с явным «человек», как было раньше; с женским фото — женская одежда и фигура.
+        portrait = f"{GENDER_TEXT.get(gender, '')}Portrait of {random.choice(female if gender == 'female' else male)}"
     # Фон — раньше остального: модель читает начало промпта внимательнее.
     return (
         f"{ART_STYLE}Background: {random.choice(faction.backgrounds)}, {random.choice(ART_MOODS)}. "
-        f"{GENDER_TEXT.get(gender, '')}Portrait of {attire}, {random.choice(ART_POSES)}.{role_text} "
+        f"{portrait}, {random.choice(ART_POSES)}.{role_text} "
         f"{faction.palette} {ART_SCENE}"
     )
 
@@ -2486,10 +2492,15 @@ def as_jpeg(image: bytes) -> bytes:
 def generate_card(chat_id: int, data: dict, mode: str):
     def job(status):
         photo = download_telegram_file(data["photo_id"])
-        gender, role = detect_gender_and_role(as_jpeg(photo), data.get("category", ""))
         model = current_art_model()
+        if model == "pulid":
+            gender, role = detect_gender_and_role(as_jpeg(photo), data.get("category", ""))
+        else:
+            # Nano Banana / FLUX.2 видят фото и понимают русский — без Gemini быстрее и не тратит его лимит.
+            gender, role = None, data.get("category") or None
         logger.info("Генерация для %s: пол %s, модель %s", chat_id, gender, model)
-        art = generate_art(model, build_art_prompt(data, role, gender), photo, data["photo_mime"])
+        art = generate_art(model, build_art_prompt(data, role, gender, sees_photo=model != "pulid"),
+                           photo, data["photo_mime"])
         logger.info("Арт для %s нарисован", chat_id)
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
