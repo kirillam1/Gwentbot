@@ -45,6 +45,11 @@ GEMINI_MODELS = list(dict.fromkeys(
     [GEMINI_MODEL] + [m.strip() for m in os.getenv(
         "GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-2.5-flash").split(",") if m.strip()]))
 FAL_KEY = os.getenv("FAL_API_KEY")
+# Запасной «мозг» для текста, когда Gemini недоступен: любой OpenAI-совместимый API.
+# По умолчанию — бесплатный роутер OpenRouter (около 50 запросов в день). Без ключа выключен.
+FALLBACK_LLM_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("FALLBACK_LLM_KEY")
+FALLBACK_LLM_URL = os.getenv("FALLBACK_LLM_URL", "https://openrouter.ai/api/v1/chat/completions")
+FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "openrouter/free")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
 # На Amvera постоянное хранилище — /data: база там переживает пересборки.
 DB_PATH = os.getenv("DB_PATH") or os.path.join("/data" if os.path.isdir("/data") else BASE_DIR, "lavk.db")
@@ -909,9 +914,7 @@ def gemini_generate(contents, config) -> Optional[str]:
     Модель с исчерпанной квотой отключается до сброса лимита — бот не тратит время
     на заведомо неудачные запросы. None — ни одна модель сейчас не доступна.
     """
-    if gemini_client is None:
-        return None
-    for model in GEMINI_MODELS:
+    for model in (GEMINI_MODELS if gemini_client is not None else []):
         with _gemini_lock:
             if time.time() < _gemini_blocked.get(model, 0):
                 continue
@@ -947,7 +950,44 @@ def gemini_generate(contents, config) -> Optional[str]:
                 logger.warning("Ошибка Gemini %s (попытка %s/2): %s", model, attempt, str(e)[:300])
                 if attempt == 1:
                     time.sleep(2)
+    if isinstance(contents, str):
+        text = llm_fallback(contents, getattr(config, "temperature", None) or 1.0)
+        if text:
+            return text
     logger.warning("Gemini: все модели сейчас недоступны, обхожусь без него")
+    return None
+
+
+def llm_fallback(prompt: str, temperature: float = 1.0) -> Optional[str]:
+    """Запасная текстовая модель (OpenRouter и т.п.). Картинки не видит. None — не настроена или не ответила."""
+    if not FALLBACK_LLM_KEY:
+        return None
+    with _gemini_lock:
+        if time.time() < _gemini_blocked.get("fallback", 0):
+            return None
+    try:
+        r = requests.post(
+            FALLBACK_LLM_URL,
+            headers={"Authorization": f"Bearer {FALLBACK_LLM_KEY}", "Content-Type": "application/json"},
+            json={"model": FALLBACK_LLM_MODEL, "temperature": min(temperature, 1.3),
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=(10, 40),
+        )
+        if r.status_code in (402, 429):
+            # Дневной лимит бесплатных запросов — не дёргаем час.
+            with _gemini_lock:
+                _gemini_blocked["fallback"] = time.time() + 3600
+            logger.warning("Запасная модель: лимит (%s), отключаю на час", r.status_code)
+            return None
+        r.raise_for_status()
+        text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        # Рассуждающие модели иногда оставляют свои мысли в ответе.
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+        if text:
+            logger.info("Ответила запасная модель %s", FALLBACK_LLM_MODEL)
+            return text
+    except Exception as e:
+        logger.warning("Запасная модель не ответила: %s", str(e)[:200])
     return None
 
 
@@ -976,6 +1016,13 @@ def parse_json(text: Optional[str]):
     try:
         return json.loads(text)
     except ValueError:
+        # Модели без строгого JSON-режима обрамляют ответ текстом — берём первый объект {...}.
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except ValueError:
+                pass
         return None
 
 
@@ -2508,6 +2555,15 @@ def art_direction(photo: bytes, data: dict) -> Optional[dict]:
     config = genai_types.GenerateContentConfig(temperature=1.1, response_mime_type="application/json")
     answer = parse_json(gemini_generate(
         [genai_types.Part.from_bytes(data=photo, mime_type="image/jpeg"), prompt], config))
+    if not isinstance(answer, dict):
+        # Запасная модель фото не видит: пол не угадываем, одежду описываем без пола —
+        # художник (Nano Banana) сам возьмёт пол с фото.
+        blind = (prompt.replace("for the person in this photo", "for the person on this card")
+                 .replace("Respect the person's real gender, age and build from the photo.",
+                          "You cannot see the person: describe the outfit and pose without stating gender "
+                          "(say \"the character\") and set gender to null.")
+                 .replace('"gender": "female" or "male"', '"gender": null'))
+        answer = parse_json(llm_fallback(blind, 1.1))
     if not isinstance(answer, dict):
         return None
     result = {}

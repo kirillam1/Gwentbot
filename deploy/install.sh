@@ -56,6 +56,10 @@ if [ ! -s "$ENV_FILE" ]; then
   ask "GEMINI_API_KEY" GEMINI_API_KEY
   ask "FAL_API_KEY" FAL_API_KEY
   ask "ADMIN_ID (твой Telegram ID, цифрами)" ADMIN_ID
+  optional=""
+  read -r -p "OPENROUTER_API_KEY (необязательно — Enter, чтобы пропустить): " optional < /dev/tty || true
+  optional="${optional//[[:space:]]/}"
+  [ -n "$optional" ] && echo "OPENROUTER_API_KEY=$optional" >> "$ENV_FILE.tmp"
   echo "DB_PATH=$DATA_DIR/lavk.db" >> "$ENV_FILE.tmp"
   install -m 600 -o root -g root "$ENV_FILE.tmp" "$ENV_FILE"
   rm -f "$ENV_FILE.tmp"
