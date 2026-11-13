@@ -2196,8 +2196,9 @@ def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str], see
     if sees_photo and not gender:
         # Модель сама видит человека на фото — пол не определяем через Gemini, даём ей оба варианта одежды.
         index = random.randrange(min(len(male), len(female)))
-        portrait = (f"Keep the person's real gender from the reference photo. Portrait of {male[index]} "
-                    f"(if the person is a woman: {female[index]})")
+        portrait = ("Look at the reference photo and keep the person's real gender. "
+                    f"If the person is a woman, paint {female[index]}. "
+                    f"If the person is a man, paint {male[index]}. The character is shown")
     else:
         # Без пола — мужской вариант с явным «человек», как было раньше; с женским фото — женская одежда и фигура.
         portrait = f"{GENDER_TEXT.get(gender, '')}Portrait of {random.choice(female if gender == 'female' else male)}"
@@ -2215,8 +2216,9 @@ def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str], see
 # поэтому модель выбирается в админке после сравнения на реальных фото.
 IDENTITY_PREFIX = (
     "Paint a brand-new dark fantasy portrait of the person from the reference photo. "
-    "Keep their exact facial identity so they are clearly recognizable: face shape, eyes, eyebrows, nose, lips, "
-    "jawline, hairline, skin tone and apparent age. Do NOT copy the photo's clothes, background, lighting, "
+    "Keep their exact facial identity so they are clearly recognizable: the same gender, face shape, eyes, "
+    "eyebrows, nose, lips, jawline, hairline, skin tone and apparent age; never turn a woman into a man or a man "
+    "into a woman. Do NOT copy the photo's clothes, background, lighting, "
     "camera angle or framing; do not include the photo itself. "
 )
 ART_MODELS = {
