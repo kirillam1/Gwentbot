@@ -46,6 +46,8 @@ if [ ! -s "$ENV_FILE" ]; then
     local value=""
     while [ -z "$value" ]; do
       read -r -p "$1: " value < /dev/tty
+      # При вставке с телефона часто прилипают пробелы и переносы строк.
+      value="${value//[[:space:]]/}"
     done
     printf '%s=%s\n' "$2" "$value" >> "$ENV_FILE.tmp"
   }
