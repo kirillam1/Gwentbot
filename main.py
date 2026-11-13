@@ -9,6 +9,7 @@ import re
 import socket
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -106,8 +107,8 @@ busy_users: set[int] = set()
     STATE_FRAME, STATE_ABILITY, STATE_QUOTE, STATE_CONFIRM, STATE_SPIRITS,
     STATE_EDIT_PROMPT, STATE_EDIT_CONFIRM, STATE_TOPUP_AMOUNT,
     STATE_ADMIN_FIND, STATE_ADMIN_BALANCE, STATE_ADMIN_BROADCAST, STATE_ADMIN_BROADCAST_CONFIRM,
-    STATE_PROMO, STATE_ADMIN_PROMO, STATE_ADMIN_SCENE, STATE_ADMIN_MODELTEST,
-) = range(24)
+    STATE_PROMO, STATE_ADMIN_PROMO, STATE_ADMIN_SCENE, STATE_ADMIN_MODELTEST, STATE_ADMIN_RESTORE,
+) = range(25)
 
 @dataclass(frozen=True)
 class Faction:
@@ -2711,6 +2712,7 @@ def admin_panel_markup():
                types.InlineKeyboardButton("🎟 Промокоды", callback_data="adm:promo"))
     markup.add(types.InlineKeyboardButton("🎨 Картинки Лавка", callback_data="adm:scenes"),
                types.InlineKeyboardButton("🧪 Модель артов", callback_data="adm:models"))
+    markup.add(types.InlineKeyboardButton("♻️ Восстановить из копии", callback_data="adm:restore"))
     return markup
 
 
@@ -2976,6 +2978,17 @@ def cb_admin(call):
             return
         logger.info("Модель артов: %s", parts[2])
         bot.send_message(chat_id, f"✅ Новые картищи рисует <b>{ART_MODELS[parts[2]][0]}</b>.")
+    elif action == "restore":
+        user_states[chat_id] = STATE_ADMIN_RESTORE
+        bot.send_message(
+            chat_id,
+            "♻️ <b>Восстановление из копии</b>\n\n"
+            "Пришли сюда <b>файлом</b> (скрепка → Файл):\n"
+            "• <code>lavk.db</code> — база: бойцы, балансы, колоды, промокоды. Бот подменит базу и перезапустится.\n"
+            "• <code>.zip</code> с папкой <code>arts</code> — чистые арты для правок старых картищ (необязательно).\n\n"
+            "<i>Текущая база не удаляется — сохраняется рядом как резервная. Telegram пропускает файлы до 20 МБ.</i>",
+            reply_markup=get_cancel_menu(),
+        )
     elif action == "modeltest":
         user_states[chat_id] = STATE_ADMIN_MODELTEST
         bot.send_message(chat_id, f"📸 Пришли фото человека — нарисую его всеми {len(ART_MODELS)} моделями "
@@ -3126,6 +3139,99 @@ def admin_promo(message):
     bot.send_message(chat_id, f"✅ Промокод <code>{esc(code)}</code> создан: {amount}⭐, {limit}.",
                      reply_markup=get_main_menu(chat_id))
     show_promos(chat_id)
+
+
+SQLITE_MAGIC = b"SQLite format 3\x00"
+ART_NAME_RE = re.compile(r"(?:^|/)(\d+)\.jpe?g$", re.IGNORECASE)
+
+
+def restore_db(data: bytes) -> str:
+    """Проверяет присланную базу и подменяет текущую. Возвращает сводку; ValueError — файл не подходит."""
+    import sqlite3
+    if not data.startswith(SQLITE_MAGIC):
+        raise ValueError("это не файл базы SQLite")
+    folder = os.path.dirname(DB_PATH) or "."
+    tmp = os.path.join(folder, "restore.tmp.db")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        check = sqlite3.connect(tmp)
+        try:
+            if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("файл базы повреждён")
+            tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"users", "cards"} <= tables:
+                raise ValueError("в файле нет таблиц бота — нужен lavk.db, а не gwent_bot.db")
+            users = check.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            cards = check.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+            stars = check.execute("SELECT COALESCE(SUM(balance), 0) FROM users").fetchone()[0]
+        finally:
+            check.close()
+    except sqlite3.DatabaseError as e:
+        os.remove(tmp)
+        raise ValueError(f"не читается как база: {e}") from e
+    except ValueError:
+        os.remove(tmp)
+        raise
+    global db
+    with db.lock:
+        db.conn.close()
+        if os.path.exists(DB_PATH):
+            os.replace(DB_PATH, f"{DB_PATH}.before-restore-{int(time.time())}")
+        os.replace(tmp, DB_PATH)
+        # Новое подключение сразу (с миграциями схемы) — бот продолжает работать без перезапуска.
+        db = Database(DB_PATH)
+    logger.warning("База восстановлена из копии: %s бойцов, %s картищ", users, cards)
+    return f"👥 Бойцов: <b>{users}</b>\n🃏 Картищ: <b>{cards}</b>\n⭐ Звёзд на балансах: <b>{stars}</b>"
+
+
+def restore_arts(data: bytes) -> int:
+    """Распаковывает арты вида NNN.jpg из zip в папку артов. Пути из архива не используются — только номер."""
+    count = 0
+    os.makedirs(ART_DIR, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            m = ART_NAME_RE.search(info.filename)
+            if not m or info.is_dir() or info.file_size > 20_000_000:
+                continue
+            with open(os.path.join(ART_DIR, f"{int(m.group(1))}.jpg"), "wb") as f:
+                f.write(zf.read(info))
+            count += 1
+    return count
+
+
+@bot.message_handler(content_types=["document", "photo", "text"],
+                     func=lambda msg: user_states.get(msg.chat.id) == STATE_ADMIN_RESTORE and is_admin(msg.from_user.id))
+def admin_restore(message):
+    chat_id = message.chat.id
+    doc = message.document
+    if not doc:
+        bot.send_message(chat_id, "⚠️ Нужен файл: скрепка → Файл → lavk.db или .zip с артами. Или жми «Отмена».")
+        return
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        bot.send_message(chat_id, "⚠️ Файл больше 20 МБ — Telegram не даст боту его скачать. "
+                                  "Для артов раздели архив на части по 20 МБ.")
+        return
+    name = (doc.file_name or "").lower()
+    try:
+        data = download_telegram_file(doc.file_id)
+        if data.startswith(SQLITE_MAGIC) or name.endswith(".db"):
+            summary = restore_db(data)
+            reset_user(chat_id)
+            bot.send_message(chat_id, f"✅ <b>База восстановлена!</b>\n\n{summary}\n\n"
+                                      "Бот уже работает с ней — можно сразу проверять.")
+            return
+        if data[:2] == b"PK" or name.endswith(".zip"):
+            count = restore_arts(data)
+            bot.send_message(chat_id, f"🖼 Арты восстановлены: <b>{count}</b>. "
+                                      "Можно прислать ещё архив или жми «Отмена».")
+            return
+        bot.send_message(chat_id, "⚠️ Не понял файл. Нужен lavk.db или .zip с артами.")
+    except (ValueError, zipfile.BadZipFile) as e:
+        bot.send_message(chat_id, f"⚠️ Не подошло: {esc(e)}")
+    except Exception:
+        logger.exception("Восстановление из копии не удалось")
+        bot.send_message(chat_id, "⚠️ Не получилось, смотри лог.")
 
 
 @bot.message_handler(content_types=["photo", "document", "text"],
