@@ -2188,9 +2188,19 @@ GENDER_TEXT = {
 }
 
 
-def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str], sees_photo: bool = False) -> str:
+def build_art_prompt(data: dict, role: Optional[str], gender: Optional[str], sees_photo: bool = False,
+                     direction: Optional[dict] = None) -> str:
     key = data.get("faction_key") or next((k for k, f in FACTIONS.items() if f.name == data.get("faction")), "Neutral")
     faction = FACTIONS.get(key, FACTIONS["Neutral"])
+    if direction:
+        # Концепт от Gemini: своя одежда, поза и фон под класс и способность — карты не похожи друг на друга.
+        gender = direction.get("gender") or gender
+        return (
+            f"{ART_STYLE}Background: {direction['background']}. "
+            f"{GENDER_TEXT.get(gender, '')}Portrait of the character wearing {direction['outfit']}, "
+            f"{direction['pose']}. {direction['details']}. "
+            f"{faction.palette} {ART_SCENE}"
+        )
     male, female = ATTIRE.get(key, ATTIRE["Neutral"])
     role_text = f" Their trade: {role}." if role and len(role) <= 60 else ""
     if sees_photo and not gender:
@@ -2466,22 +2476,50 @@ def ask_gemini_vision(image: bytes, prompt: str, as_json: bool = False):
     return parse_json(text) if as_json else text
 
 
-def detect_gender_and_role(photo: bytes, category: str) -> tuple[Optional[str], Optional[str]]:
-    """Пол по фото и перевод класса — одним запросом, чтобы экономить бесплатный лимит Gemini."""
-    answer = ask_gemini_vision(
-        photo,
-        "1) Is the main person in this photo a woman or a man? "
-        f"2) Translate this fantasy character class into English, 1-4 words: «{category}». "
-        'Reply as JSON {"gender": "female" or "male", "role": "<english class>"}.',
-        as_json=True,
+ART_DIRECTION_FIELDS = ("outfit", "pose", "background", "details")
+
+
+def art_direction(photo: bytes, data: dict) -> Optional[dict]:
+    """Gemini как арт-директор: по фото и анкете придумывает уникальные одежду, позу, фон и детали.
+
+    Один запрос вместо прежнего «пол + перевод класса». None — Gemini недоступен, тогда работают заготовки.
+    """
+    key = data.get("faction_key") or next((k for k, f in FACTIONS.items() if f.name == data.get("faction")), "Neutral")
+    faction = FACTIONS.get(key, FACTIONS["Neutral"])
+    male, female = ATTIRE.get(key, ATTIRE["Neutral"])
+    card = "\n".join(f"- {label}: {strip_markup(str(data[k]))}" for k, label in
+                     (("name", "Name"), ("category", "Class"), ("ability", "Ability"), ("quote", "Quote"))
+                     if data.get(k))
+    prompt = (
+        "You are the art director of GWENT: The Witcher Card Game. Design the card art for the person in this photo.\n"
+        f"Faction: {faction.name} ({key}). Palette: {faction.palette}\n"
+        f"Card (may be in Russian):\n{card or '- (no details, invent a fitting character)'}\n\n"
+        "Faction inspiration — do NOT copy, invent something new in the same spirit:\n"
+        f"- places: {'; '.join(random.sample(faction.backgrounds, min(3, len(faction.backgrounds))))}\n"
+        f"- outfits: {random.choice(male)}; {random.choice(female)}\n\n"
+        "Invent ONE vivid, specific concept that clearly shows the class and the ability: a distinctive outfit "
+        "with concrete materials, colors and accessories; a dynamic, expressive pose or action (not a generic "
+        "standing pose) that suits a waist-up or three-quarter portrait with the face clearly visible; a concrete "
+        "location with weather and lighting; and props, weapon or magic effects tied to the ability. "
+        "Respect the person's real gender, age and build from the photo. Avoid modern items.\n"
+        'Reply as JSON in English: {"gender": "female" or "male", "outfit": "...", "pose": "...", '
+        '"background": "...", "details": "..."}, each value one or two sentences.'
     )
+    config = genai_types.GenerateContentConfig(temperature=1.1, response_mime_type="application/json")
+    answer = parse_json(gemini_generate(
+        [genai_types.Part.from_bytes(data=photo, mime_type="image/jpeg"), prompt], config))
     if not isinstance(answer, dict):
-        return None, None
+        return None
+    result = {}
+    for field in ART_DIRECTION_FIELDS:
+        value = re.sub(r"\s+", " ", str(answer.get(field) or "")).strip().rstrip(".")
+        if not value or CYRILLIC.search(value):
+            return None
+        result[field] = value[:400]
+    result["pose"] = result["pose"][:1].lower() + result["pose"][1:]
     gender = str(answer.get("gender", "")).strip().lower()
-    role = str(answer.get("role", "")).strip() or None
-    if role and CYRILLIC.search(role):
-        role = None
-    return (gender if gender in ("female", "male") else None), role
+    result["gender"] = gender if gender in ("female", "male") else None
+    return result
 
 
 def as_jpeg(image: bytes) -> bytes:
@@ -2495,14 +2533,15 @@ def generate_card(chat_id: int, data: dict, mode: str):
     def job(status):
         photo = download_telegram_file(data["photo_id"])
         model = current_art_model()
-        if model == "pulid":
-            gender, role = detect_gender_and_role(as_jpeg(photo), data.get("category", ""))
-        else:
-            # Nano Banana / FLUX.2 видят фото и понимают русский — без Gemini быстрее и не тратит его лимит.
-            gender, role = None, data.get("category") or None
+        direction = art_direction(as_jpeg(photo), data)
+        gender = direction["gender"] if direction else None
+        if direction is None:
+            logger.info("Арт-директор Gemini недоступен для %s — беру заготовки", chat_id)
         logger.info("Генерация для %s: пол %s, модель %s", chat_id, gender, model)
-        art = generate_art(model, build_art_prompt(data, role, gender, sees_photo=model != "pulid"),
-                           photo, data["photo_mime"])
+        # Без концепта новые модели видят фото сами, а русский класс понимают без перевода.
+        prompt = build_art_prompt(data, data.get("category") or None, gender,
+                                  sees_photo=model != "pulid", direction=direction)
+        art = generate_art(model, prompt, photo, data["photo_mime"])
         logger.info("Арт для %s нарисован", chat_id)
         card_data = {k: v for k, v in data.items()
                      if k not in ("photo_id", "photo_mime", "photo_doc", "faction_key")}
@@ -2751,8 +2790,9 @@ def run_model_test(chat_id: int, photo: bytes, mime: str):
     """Один и тот же персонаж всеми моделями — чтобы сравнить сходство, руки и детали."""
     key = random.choice(list(FACTIONS))
     data = {"faction_key": key, "faction": FACTIONS[key].name}
-    gender, _ = detect_gender_and_role(as_jpeg(photo), "")
-    prompt = build_art_prompt(data, None, gender)
+    direction = art_direction(as_jpeg(photo), data)
+    gender = direction["gender"] if direction else None
+    prompt = build_art_prompt(data, None, gender, sees_photo=True, direction=direction)
     status = bot.send_message(chat_id, f"🧪 Рисую всеми моделями: {FACTIONS[key].name}, пол {gender or '?'}… "
                                        "Обычно 30–90 секунд.")
 
