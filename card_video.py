@@ -61,6 +61,66 @@ def video_source_image(art_bytes: bytes) -> tuple[bytes, tuple[float, float, flo
     return out.getvalue(), (0.0, top / sh, 1.0, win_h / sh)
 
 
+def media_duration(path: str) -> float:
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                         capture_output=True, timeout=30)
+    try:
+        return float(out.stdout.decode().strip())
+    except ValueError:
+        return 0.0
+
+
+def has_audio_stream(path: str) -> bool:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                          "-of", "csv=p=0", path], capture_output=True, timeout=30)
+    return bool(out.stdout.strip())
+
+
+def make_loop(raw_video: bytes, length: float = 7.0, timeout: int = 180) -> bytes:
+    """Бесшовная петля: последний отрезок ролика плавно перетекает в начало (и картинка, и звук).
+
+    Из ролика длиной L получается петля length = L - d, где d — длина перехода: выход начинается
+    с секунды d исходника, а его последние d секунд смешаны с началом. Конец петли совпадает с её началом.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "src.mp4"), os.path.join(tmp, "loop.mp4")
+        with open(src, "wb") as f:
+            f.write(raw_video)
+        total = media_duration(src)
+        if total <= 1.0:
+            return raw_video
+        d = total - length if total - length >= 0.4 else min(1.0, total / 4)
+        d = min(d, total / 3)
+        has_audio = has_audio_stream(src)
+        graph = (f"[0:v]fps=30,format=yuv420p,split[va][vb];"
+                 f"[va]trim=start={d:.3f},setpts=PTS-STARTPTS[vmain];"
+                 f"[vb]trim=end={d:.3f},setpts=PTS-STARTPTS[vhead];"
+                 f"[vmain][vhead]xfade=transition=fade:duration={d:.3f}:offset={total - 2 * d:.3f}[v]")
+        maps = ["-map", "[v]"]
+        if has_audio:
+            # acrossfade молча отдаёт пустую дорожку, когда второй кусок равен длине склейки,
+            # поэтому склейка вручную: конец затухает, начало нарастает поверх него.
+            fade_at = total - 2 * d
+            graph += (f";[0:a]asplit[aa][ab];"
+                      f"[aa]atrim=start={d:.3f},asetpts=PTS-STARTPTS,afade=t=out:st={fade_at:.3f}:d={d:.3f}[amain];"
+                      f"[ab]atrim=end={d:.3f},asetpts=PTS-STARTPTS,afade=t=in:d={d:.3f},"
+                      f"adelay={round(fade_at * 1000)}:all=1[ahead];"
+                      f"[amain][ahead]amix=inputs=2:duration=first:normalize=0[a]")
+            maps += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", graph, *maps,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", dst]
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if result.returncode != 0 and has_audio:
+            # Без звуковой дорожки в исходнике — повтор только с видео.
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", graph.split(";[0:a]")[0],
+                   "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", dst]
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg loop: {result.stderr.decode(errors='replace')[-800:]}")
+        with open(dst, "rb") as f:
+            return f.read()
+
+
 def card_overlay(data: dict) -> tuple[Image.Image, tuple[int, int]]:
     """Полная карта (как картинка карты: рамка + панель со способностью и цитатой) с прозрачным окном арта.
     Возвращает слой и левый верхний угол окна арта в нём.

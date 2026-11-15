@@ -79,12 +79,14 @@ ART_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "arts")   # чис�
 VIDEO_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "videos")  # готовые анимированные картищи
 
 # ---------- анимированная картища ----------
-ANIM_PRICE = int(os.getenv("ANIM_PRICE", "300"))
-# Veo 3.1 Fast (Google) — видео со звуком из картинки, ~$0.15/с (6 с ≈ $0.90). Ключ тот же FAL_API_KEY.
-# Полная Veo 3.1 (~$0.40/с, 6 с ≈ $2.40): VIDEO_MODEL=fal-ai/veo3.1/image-to-video в /etc/lavk.env
-VIDEO_MODEL = os.getenv("VIDEO_MODEL", "fal-ai/veo3.1/fast/image-to-video")
+ANIM_PRICE = int(os.getenv("ANIM_PRICE", "320"))
+# Veo 3.1 Fast (Google), режим «первый и последний кадр»: оба кадра — сам арт, поэтому ролик
+# возвращается туда же, откуда начал, — основа для бесшовной петли. ~$0.15/с, 8 с ≈ $1.20.
+# Ключ тот же FAL_API_KEY. Полная Veo 3.1 (~$0.40/с): VIDEO_MODEL=fal-ai/veo3.1/first-last-frame-to-video
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "fal-ai/veo3.1/fast/first-last-frame-to-video")
 VIDEO_ENDPOINT = f"https://queue.fal.run/{VIDEO_MODEL}"
-VIDEO_DURATION = os.getenv("VIDEO_DURATION", "6s")    # у Veo: 4s, 6s или 8s
+VIDEO_DURATION = os.getenv("VIDEO_DURATION", "8s")    # у Veo: 4s, 6s или 8s
+LOOP_SECONDS = float(os.getenv("LOOP_SECONDS", "7"))   # итоговая петля: 8 с ролика − 1 с на склейку
 VIDEO_RESOLUTION = "1080p"                             # у Veo 720p и 1080p стоят одинаково
 VIDEO_DEADLINE = 480                                   # секунд на ролик (обычно 1–3 мин)
 
@@ -3109,7 +3111,8 @@ ANIM_BASE_PROMPT = (
     "The character stays in the same place and pose and keeps exactly the same face, identity, outfit and "
     "painterly digital oil painting style. Natural subtle motion: calm breathing, blinking, a slight head "
     "movement, hair and cloth moving gently. {subject} The environment comes alive: {environment}. "
-    "Smooth continuous motion, one single shot, no cuts. "
+    "Smooth continuous motion, one single shot, no cuts. The motion is a seamless loop: everything gently "
+    "returns to exactly the starting frame at the end. "
     "Audio: {sound}. No dialogue, no speech, no narration, no singing."
 )
 ANIM_NEGATIVE = ("text, letters, subtitles, watermark, logo, scene cut, camera shake, fast camera movement, zoom out, "
@@ -3137,7 +3140,7 @@ def animation_prompt(data: dict, art: bytes) -> tuple[str, str]:
     # Gemini смотрит на сам арт: что в нём может двигаться (оружие, плащ, волосы) и есть ли там магия.
     answer = ask_gemini_vision(
         as_jpeg(art),
-        "You direct a 6-second subtle animation of this fantasy card art. Reply with JSON "
+        "You direct a short, seamlessly looping subtle animation of this fantasy card art. Reply with JSON "
         '{"subject": "...", "magic": false}. '
         "subject — one English sentence (max 30 words) describing natural, subtle physical movements of the "
         "character and the objects they hold or wear in this exact image (e.g. a cloak swaying, fingers "
@@ -3166,10 +3169,14 @@ def video_path(card_id: int) -> str:
 def generate_video(source_jpeg: bytes, prompt: str, negative: str = ANIM_NEGATIVE) -> bytes:
     image_url = fal_upload(source_jpeg, name="anim_source.jpg") or to_data_uri(source_jpeg, "image/jpeg")
     payload = {
-        "prompt": prompt, "negative_prompt": negative, "image_url": image_url,
+        "prompt": prompt, "negative_prompt": negative,
         "aspect_ratio": "9:16", "duration": VIDEO_DURATION, "resolution": VIDEO_RESOLUTION,
         "generate_audio": True, "auto_fix": True, "safety_tolerance": FAL_SAFETY,
     }
+    if "first-last-frame" in VIDEO_MODEL:
+        payload["first_frame_url"] = payload["last_frame_url"] = image_url
+    else:
+        payload["image_url"] = image_url
     try:
         body = fal_queue(VIDEO_ENDPOINT, payload, VIDEO_DEADLINE)
     except FalError as e:
@@ -3224,6 +3231,7 @@ def animate_card(chat_id: int, card_id: int, mode: str):
         logger.info("Видео для картищи %s нарисовано за %.0f с", card_id, time.monotonic() - started)
         with RENDER_LOCK:
             overlay, window_pos = card_video.card_overlay(card["data"])
+        raw = card_video.make_loop(raw, LOOP_SECONDS)
         mp4 = card_video.compose_card_video(raw, overlay, window_pos, window)
         try:
             gif = card_video.make_gif(mp4)
@@ -3288,7 +3296,7 @@ def send_anim_invoice(chat_id: int, card_id: int):
         bot.send_invoice(
             chat_id,
             title="Живая картища",
-            description=f"Лавк оживит твою картищу: {VIDEO_DURATION[:-1]} секунд анимации со звуком в рамке карты.",
+            description="Лавк оживит твою картищу: зацикленная анимация со звуком прямо в рамке карты, MP4 и GIF.",
             invoice_payload=f"anim:{chat_id}:{card_id}:{ANIM_PRICE}",
             provider_token="",
             currency="XTR",
@@ -3353,8 +3361,8 @@ def cb_anim(call):
         bot.send_message(
             chat_id,
             f"🎬 <b>Живая картища</b>\n\nЛавк оживит «{esc(strip_markup(card['data'].get('name', '')))}»: "
-            f"{VIDEO_DURATION[:-1]} секунд анимации со звуком — арт оживает прямо в рамке, рядом способность "
-            "и цитата, как в игре. Движение и звуки — в духе фракции.\n"
+            "арт оживает прямо в рамке, рядом способность и цитата, как в игре. Анимация со звуком и "
+            "зациклена — крутится бесконечно без шва. Движение и звуки — в духе фракции.\n"
             "Пришлю в двух форматах: <b>MP4</b> со звуком и <b>GIF</b> файлом.\n\n"
             f"Стоимость: {price}",
             reply_markup=markup,
