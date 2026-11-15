@@ -80,9 +80,9 @@ VIDEO_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "videos")  # го
 
 # ---------- анимированная картища ----------
 ANIM_PRICE = int(os.getenv("ANIM_PRICE", "300"))
-# Veo 3.1 (Google) — видео со звуком из картинки. Ключ тот же FAL_API_KEY.
-# Дешевле в ~2,7 раза: VIDEO_MODEL=fal-ai/veo3.1/fast/image-to-video
-VIDEO_MODEL = os.getenv("VIDEO_MODEL", "fal-ai/veo3.1/image-to-video")
+# Veo 3.1 Fast (Google) — видео со звуком из картинки, ~$0.15/с (6 с ≈ $0.90). Ключ тот же FAL_API_KEY.
+# Полная Veo 3.1 (~$0.40/с, 6 с ≈ $2.40): VIDEO_MODEL=fal-ai/veo3.1/image-to-video в /etc/lavk.env
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "fal-ai/veo3.1/fast/image-to-video")
 VIDEO_ENDPOINT = f"https://queue.fal.run/{VIDEO_MODEL}"
 VIDEO_DURATION = os.getenv("VIDEO_DURATION", "6s")    # у Veo: 4s, 6s или 8s
 VIDEO_RESOLUTION = "1080p"                             # у Veo 720p и 1080p стоят одинаково
