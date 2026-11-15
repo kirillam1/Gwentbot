@@ -237,6 +237,31 @@ class Database:
         with self.lock, self.conn:
             self.conn.execute("UPDATE cards SET file_id = ? WHERE id = ?", (file_id, card_id))
 
+    def unlock_card(self, card_id: int, user_id: int, data: dict, price: int) -> str:
+        """Снимает с пробной картищи пометку trial и списывает звёзды — одной транзакцией.
+
+        ok — сделано; done — уже чистая (или не найдена); no_money — не хватает звёзд.
+        price=0 — бесплатно (безлимит/админ).
+        """
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT data FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id)).fetchone()
+            if row is None or not json.loads(row["data"]).get("trial"):
+                return "done"
+            if price:
+                cur = self.conn.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?", (price, user_id, price)
+                )
+                if not cur.rowcount:
+                    return "no_money"
+                self.conn.execute(
+                    "INSERT INTO transactions (user_id, amount, kind, created_at) VALUES (?, ?, 'unlock', ?)",
+                    (user_id, -price, now()),
+                )
+            # file_id сбрасываем: старый — с водяными знаками; из колоды карта перерисуется чистой.
+            self.conn.execute("UPDATE cards SET data = ?, file_id = '' WHERE id = ?",
+                              (json.dumps(data, ensure_ascii=False), card_id))
+            return "ok"
+
     @staticmethod
     def _card(row):
         if row is None:

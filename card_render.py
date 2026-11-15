@@ -6,6 +6,7 @@
 """
 import io
 import os
+import random
 import re
 import zipfile
 from functools import lru_cache
@@ -456,24 +457,117 @@ def draw_panel(canvas: Image.Image, data: dict) -> int:
     return bottom
 
 
-def watermark(img: Image.Image) -> Image.Image:
-    """Крупные диагональные надписи поверх всей картинки — для пробной картищи."""
-    w, h = img.size
-    fnt = font(FONT_NAME, max(36, int((w * h) ** 0.5) // 11))
-    text = WATERMARK_TEXT
-    step_x = round(fnt.getlength(text + "   "))
-    step_y = round(fnt.size * 2.6)
-    side = int((w ** 2 + h ** 2) ** 0.5) + step_x
+# Пробная картища: знак специально сделан трудным для нейросетей-«стиралок».
+# Они хорошо убирают редкий ровный текст одного цвета; плохо — когда помеха покрывает
+# всю картинку, каждый раз лежит по-новому и смешана с самим рисунком.
+TRIAL_MAX_SIDE = 900          # пробная уходит в пониженном разрешении: даже стёртая — не годится для печати
+TRIAL_JPEG_QUALITY = 80
+
+
+def _tiled_text(size, text: str, fnt, angle: float, rng, colors, alpha: int) -> Image.Image:
+    """Повторяющаяся надпись под углом со случайным сдвигом сетки; цвет строк чередуется."""
+    w, h = size
+    step_x = round(fnt.getlength(text + "  "))
+    step_y = round(fnt.size * rng.uniform(2.0, 2.6))
+    side = int((w ** 2 + h ** 2) ** 0.5) + 2 * step_x
     layer = Image.new("RGBA", (side, side), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
-    for row, y in enumerate(range(0, side, step_y)):
-        for x in range(-step_x + (row % 2) * step_x // 2, side, step_x):
-            draw.text((x, y), text, font=fnt, fill=(255, 255, 255, 120),
-                      stroke_width=max(2, fnt.size // 18), stroke_fill=(0, 0, 0, 90))
-    layer = layer.rotate(30, resample=Image.BICUBIC)
+    off_x, off_y = rng.randrange(step_x), rng.randrange(step_y)
+    stroke = max(1, fnt.size // 16)
+    for row, y in enumerate(range(-off_y, side, step_y)):
+        fill = colors[row % len(colors)]
+        shift = rng.randrange(step_x)          # каждая строка со своим сдвигом — нет ровной решётки
+        for x in range(-off_x - shift, side, step_x):
+            draw.text((x, y), text, font=fnt, fill=fill + (alpha,),
+                      stroke_width=stroke, stroke_fill=(0, 0, 0, alpha * 2 // 3))
+    layer = layer.rotate(angle, resample=Image.BICUBIC)
     left, top = (side - w) // 2, (side - h) // 2
+    return layer.crop((left, top, left + w, top + h))
+
+
+def _guilloche(size, rng, k: float) -> Image.Image:
+    """Сетка тонких волнистых линий по всей картинке, как на банкнотах."""
+    w, h = size
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    width = max(1, round(k / 450))
+    xs = np.arange(-20, w + 21, 6, dtype=float)
+    for family, tilt in enumerate((rng.uniform(0.15, 0.4), -rng.uniform(0.15, 0.4))):
+        spacing = k / rng.uniform(22, 30)
+        amp = k / rng.uniform(30, 45)
+        period = k / rng.uniform(3.5, 6)
+        phase = rng.uniform(0, 2 * np.pi)
+        y0 = -abs(tilt) * w - amp
+        line = 0
+        while y0 < h + abs(tilt) * w + amp:
+            ys = y0 + xs * tilt + amp * np.sin(2 * np.pi * xs / period + phase + line * 0.35)
+            color = (255, 255, 255, 70) if (line + family) % 2 else (20, 14, 8, 60)
+            draw.line(list(zip(xs.tolist(), ys.tolist())), fill=color, width=width)
+            y0 += spacing
+            line += 1
+    return layer
+
+
+def _seal(size, center, k: float, rng) -> Image.Image:
+    """Крупная печать «ЛАВК · ПРОБНАЯ» прямо по центру арта — там, где лицо."""
+    w, h = size
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    r = k * 0.23
+    cx, cy = center
+    ring = max(3, round(k / 120))
+    for rr, a in ((r, 150), (r * 0.82, 120)):
+        draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=(255, 255, 255, a), width=ring)
+        draw.ellipse((cx - rr - ring, cy - rr - ring, cx + rr + ring, cy + rr + ring),
+                     outline=(0, 0, 0, a // 2), width=max(1, ring // 2))
+    big = font(FONT_NAME, round(r * 0.62))
+    small = font(FONT_NAME, round(r * 0.22))
+    for text, fnt, dy in (("ЛАВК", big, -r * 0.12), ("ПРОБНАЯ", small, r * 0.42)):
+        tw = fnt.getlength(text)
+        draw.text((cx - tw / 2, cy + dy - fnt.size * 0.6), text, font=fnt, fill=(255, 255, 255, 165),
+                  stroke_width=max(2, fnt.size // 14), stroke_fill=(0, 0, 0, 110))
+    return layer.rotate(rng.uniform(-14, 14), center=center, resample=Image.BICUBIC)
+
+
+def watermark(img: Image.Image, tag: str = "", center=None, unit: float | None = None) -> Image.Image:
+    """Водяной знак пробной картищи.
+
+    Слои: сетка волнистых линий, крупный текст, мелкий текст с ID владельца под другим углом,
+    печать по центру арта. Углы и сдвиги каждый раз случайные — общего «шаблона» для стирания нет;
+    прозрачность «рябит» шумом, а часть слоёв не просто ложится сверху, а меняет яркость рисунка.
+    """
+    rng = random.Random()
+    w, h = img.size
+    k = unit or (w * h) ** 0.5     # unit — масштаб знака; один и тот же для обеих картинок карты
+    center = center or (w / 2, h * 0.45)
+    sign = rng.choice((-1, 1))
+
+    big = font(FONT_NAME, max(30, round(k / 13)))
+    small = font(FONT_REGULAR, max(14, round(k / 42)))
+    mark = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    mark.alpha_composite(_guilloche((w, h), rng, k))
+    mark.alpha_composite(_tiled_text((w, h), WATERMARK_TEXT, big, sign * rng.uniform(22, 36), rng,
+                                     [(255, 255, 255), (255, 214, 120)], 115))
+    tag_text = f"ЛАВК  {tag}" if tag else "ЛАВК"
+    mark.alpha_composite(_tiled_text((w, h), tag_text, small, -sign * rng.uniform(40, 60), rng,
+                                     [(255, 255, 255), (30, 20, 10)], 95))
+    mark.alpha_composite(_seal((w, h), center, k, rng))
+
+    # Шум в прозрачности: края знака «рваные», у каждой картинки свои.
+    arr = np.asarray(mark).astype(np.float32)
+    noise = np.asarray(Image.effect_noise((w, h), 60).filter(ImageFilter.GaussianBlur(1)), dtype=np.float32)
+    arr[..., 3] *= 0.75 + 0.5 * (noise / 255.0)
+    mark = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
+
     out = img.convert("RGBA")
-    out.alpha_composite(layer.crop((left, top, left + w, top + h)))
+    # Знак не только ложится поверх, но и меняет яркость рисунка под собой (как тиснение):
+    # «стиралке» мало убрать белые буквы — под ними картинка уже другая.
+    base = np.asarray(out).astype(np.float32)
+    a = np.asarray(mark)[..., 3:4].astype(np.float32) / 255.0
+    lum = np.asarray(mark.convert("L"), dtype=np.float32)[..., None] / 255.0
+    base[..., :3] *= 1.0 - 0.35 * a * (1.0 - lum)
+    out = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), "RGBA")
+    out.alpha_composite(mark)
     return out
 
 
@@ -482,17 +576,20 @@ def watermark(img: Image.Image) -> Image.Image:
 SEND_MAX_SIDE = 1280
 
 
-def to_jpeg(img: Image.Image) -> bytes:
+def to_jpeg(img: Image.Image, max_side: int = SEND_MAX_SIDE, quality: int = 86) -> bytes:
     img = img.convert("RGB")
-    if max(img.size) > SEND_MAX_SIDE:
-        img.thumbnail((SEND_MAX_SIDE, SEND_MAX_SIDE), Image.LANCZOS)
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=86, optimize=True, progressive=True)
+    img.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
     return out.getvalue()
 
 
-def render_card(art_bytes: bytes, data: dict, trial: bool = False) -> tuple[bytes, bytes]:
-    """Возвращает (полная карта с панелью, только карта в рамке без пергамента)."""
+def render_card(art_bytes: bytes, data: dict, trial: bool = False, tag: str = "") -> tuple[bytes, bytes]:
+    """Возвращает (полная карта с панелью, только карта в рамке без пергамента).
+
+    tag — ID владельца, его вписывают в водяной знак пробной картищи.
+    """
     art = Image.open(io.BytesIO(art_bytes))
     canvas = asset("background.jpg").copy()
     bottom = draw_panel(canvas, data)
@@ -501,5 +598,11 @@ def render_card(art_bytes: bytes, data: dict, trial: bool = False) -> tuple[byte
     full = canvas.crop((CROP_X[0], CROP_TOP, CROP_X[1], crop_bottom))
     card_only = canvas.crop(CARD_ONLY_BOX)
     if trial:
-        full, card_only = watermark(full), watermark(card_only)
+        # Центр арта (под печать) в координатах каждой обрезки.
+        art_cx, art_cy = (CARD_ONLY_BOX[0] + CARD_ONLY_BOX[2]) / 2, CARD_ONLY_BOX[1] + (CARD_ONLY_BOX[3] - CARD_ONLY_BOX[1]) * 0.4
+        unit = ((CARD_ONLY_BOX[2] - CARD_ONLY_BOX[0]) * (CARD_ONLY_BOX[3] - CARD_ONLY_BOX[1])) ** 0.5
+        full = watermark(full, tag, (art_cx - CROP_X[0], art_cy - CROP_TOP), unit)
+        card_only = watermark(card_only, tag, (art_cx - CARD_ONLY_BOX[0], art_cy - CARD_ONLY_BOX[1]), unit)
+        return (to_jpeg(full, TRIAL_MAX_SIDE, TRIAL_JPEG_QUALITY),
+                to_jpeg(card_only, TRIAL_MAX_SIDE, TRIAL_JPEG_QUALITY))
     return to_jpeg(full), to_jpeg(card_only)

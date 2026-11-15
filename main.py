@@ -631,7 +631,8 @@ def card_markup(card: dict, with_deck: bool = False):
     markup = types.InlineKeyboardMarkup()
     if card["data"].get("trial"):
         # Пробную картищу не правим — иначе правка за полцены снимала бы водяные знаки.
-        markup.add(types.InlineKeyboardButton(f"🎨 Чистая картища — {GENERATION_PRICE}⭐", callback_data="menu:topup"))
+        markup.add(types.InlineKeyboardButton(f"🎨 Чистая картища — {GENERATION_PRICE}⭐",
+                                              callback_data=f"unlock:{card['id']}"))
     else:
         markup.add(types.InlineKeyboardButton(f"✏️ Правка — {EDIT_PRICE}⭐", callback_data=f"edit:{card['id']}"))
     if with_deck:
@@ -1241,7 +1242,7 @@ def price_line(chat_id: int, price: int, trial_ok: bool = False) -> str:
         return "♾ <b>Для тебя бесплатно</b> — у тебя безлимит."
     if trial_ok and balance_of(chat_id) < price and has_trial(chat_id):
         return ("🎁 <b>Первая картища — в подарок!</b> Но на ней будут крупные водяные знаки Лавка.\n"
-                f"Чистая картища — {price}⭐, пополнить мешочек можно в меню.")
+                f"Снять их можно потом одной кнопкой за {price}⭐ — без новой генерации.")
     return f"💰 Стоимость: <b>{price}⭐</b> (в мешочке: {balance_of(chat_id)}⭐)"
 
 
@@ -1480,7 +1481,8 @@ def cmd_terms(message):
         "1. Звёзды, внесённые в мешочек, тратятся на создание картищ "
         f"({GENERATION_PRICE}⭐) и правки ({EDIT_PRICE}⭐).\n"
         "2. Если генерация не удалась по вине бота, звёзды автоматически возвращаются в мешочек.\n"
-        "3. Первая картища бесплатна, но выдаётся с водяными знаками; пробную картищу нельзя править.\n"
+        f"3. Первая картища бесплатна, но выдаётся с водяными знаками; снять их можно за {GENERATION_PRICE}⭐. "
+        "Пробную картищу нельзя править, пока она с водяными знаками.\n"
         "4. Картищи — фан-арт по мотивам GWENT, бот не связан с CD PROJEKT RED.\n"
         "5. Не присылай чужие фото без согласия их владельца.\n"
         f"6. Вопросы по оплате и возвраты — /paysupport или {SUPPORT_CONTACT}.",
@@ -1619,18 +1621,134 @@ def parse_topup_payload(payload: str) -> Optional[tuple[int, int, int]]:
     return user_id, pay, credit
 
 
+def parse_unlock_payload(payload: str) -> Optional[tuple[int, int, int]]:
+    """(user_id, card_id, цена) из счёта «Чистая картища»."""
+    parts = payload.split(":")
+    if parts[0] != "unlock" or len(parts) != 4 or not all(p.isdigit() for p in parts[1:]):
+        return None
+    return int(parts[1]), int(parts[2]), int(parts[3])
+
+
+# ---------- «Чистая картища»: снять водяные знаки с пробной ----------
+UNLOCK_LOCK = threading.Lock()
+
+
+def has_clean_art(card: dict) -> bool:
+    """Чистый арт пробной картищи: файл на диске или отдельное фото арта в Telegram (у старых карт)."""
+    return os.path.exists(art_path(card["id"])) or bool(card.get("art_file_id"))
+
+
+def send_unlock_invoice(chat_id: int, card_id: int):
+    try:
+        bot.send_invoice(
+            chat_id,
+            title="Чистая картища",
+            description=f"Лавк сотрёт водяные знаки с твоей пробной картищи. Та же картища, без надписей.",
+            invoice_payload=f"unlock:{chat_id}:{card_id}:{GENERATION_PRICE}",
+            provider_token="",
+            currency="XTR",
+            prices=[types.LabeledPrice(label="Чистая картища", amount=GENERATION_PRICE)],
+        )
+    except apihelper.ApiTelegramException as e:
+        logger.error("Не удалось выставить счёт на чистую картищу %s: %s", card_id, e)
+        bot.send_message(chat_id, "⚠️ Telegram не принял счёт. Попробуй ещё раз или пополни мешочек в меню.")
+
+
+def unlock_card(chat_id: int, card_id: int) -> str:
+    """ok / done (уже чистая или нет такой) / no_money / no_art (чистого арта не сохранилось)."""
+    with UNLOCK_LOCK:
+        card = db.get_card(card_id, chat_id)
+        if card is None or not card["data"].get("trial"):
+            return "done"
+        if not has_clean_art(card):
+            return "no_art"
+        data = dict(card["data"])
+        data.pop("trial", None)
+        status = db.unlock_card(card_id, chat_id, data, 0 if is_free(chat_id) else GENERATION_PRICE)
+    if status == "ok":
+        logger.info("Картища %s пользователя %s стала чистой", card_id, chat_id)
+        threading.Thread(target=send_unlocked_card, args=(chat_id, card_id), daemon=True).start()
+    return status
+
+
+def send_unlocked_card(chat_id: int, card_id: int):
+    """Перерисовывает уже оплаченную картищу без водяных знаков. Звёзды не возвращаем:
+    картища в колоде уже чистая и при открытии из «Моих картищ» перерисуется сама."""
+    try:
+        card = db.get_card(card_id, chat_id)
+        with RENDER_LOCK:
+            full, card_only = render_card(load_art(card), card["data"])
+        caption = (f"✨ <b>ЧИСТАЯ КАРТИЩА!</b>\n«{esc(strip_markup(card['data'].get('name', '')))}» · "
+                   f"{esc(card['data'].get('faction', ''))}")
+        def media(srcs):
+            return [types.InputMediaPhoto(srcs[0], caption=caption, parse_mode="HTML"), types.InputMediaPhoto(srcs[1])]
+
+        # Как в deliver_card: сначала ссылкой Fal (медленный канал до Telegram), при отказе — байтами.
+        sources = [photo_source(full, "card_full.jpg"), photo_source(card_only, "card_frame.jpg")]
+        try:
+            sent = tg_retry(bot.send_media_group, chat_id, media(sources), timeout=MEDIA_TIMEOUT)
+        except apihelper.ApiTelegramException as e:
+            if not any(isinstance(x, str) for x in sources) or not is_url_fetch_error(e):
+                raise
+            sent = tg_retry(bot.send_media_group, chat_id, media([full, card_only]), timeout=MEDIA_TIMEOUT)
+        db.set_card_file(card_id, sent[0].photo[-1].file_id)
+        bot.send_message(chat_id, "🃏 Водяные знаки стёрты — картища в колоде уже чистая. Теперь её можно и править!",
+                         reply_markup=card_markup(db.get_card(card_id, chat_id)))
+    except Exception:
+        logger.exception("Не удалось отправить чистую картищу %s", card_id)
+        safe_call(bot.send_message, chat_id, "✅ Картища уже чистая, но Telegram не принял картинку. "
+                                             "Открой «📜 Мои картищи» — она там без надписей.",
+                  reply_markup=get_main_menu(chat_id))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("unlock:"))
+def cb_unlock(call):
+    chat_id = call.message.chat.id
+    value = call.data.split(":", 1)[1]
+    if not value.isdigit():
+        safe_call(bot.answer_callback_query, call.id)
+        return
+    status = unlock_card(chat_id, int(value))
+    if status == "ok":
+        safe_call(bot.answer_callback_query, call.id, "✨ Лавк стирает водяные знаки…")
+    elif status == "done":
+        safe_call(bot.answer_callback_query, call.id, "Эта картища уже чистая — ищи её в «Моих картищах».",
+                  show_alert=True)
+    elif status == "no_art":
+        safe_call(bot.answer_callback_query, call.id)
+        bot.send_message(chat_id, f"😔 У этой старой картищи не сохранился чистый арт. Напиши {SUPPORT_CONTACT} — "
+                                  "Лавк поможет вручную.")
+    else:  # no_money — сразу выставляем счёт именно на чистую картищу
+        safe_call(bot.answer_callback_query, call.id)
+        bot.send_message(chat_id, f"💸 В мешочке {balance_of(chat_id)}⭐, а нужно {GENERATION_PRICE}⭐.\n"
+                                  "Оплати счёт ниже — и водяные знаки исчезнут сразу после оплаты.")
+        send_unlock_invoice(chat_id, int(value))
+
+
 @bot.pre_checkout_query_handler(func=lambda query: True)
 def pre_checkout(query):
-    parsed = parse_topup_payload(query.invoice_payload)
-    user = db.get_user(query.from_user.id)
-    if (
-        parsed is None or parsed[0] != query.from_user.id or parsed[1] != query.total_amount
-        or query.currency != "XTR"
-    ):
-        bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел. Создай новый в меню пополнения.")
-        return
+    user_id = query.from_user.id
+    user = db.get_user(user_id)
     if user and user["blocked"]:
         bot.answer_pre_checkout_query(query.id, ok=False, error_message="Доступ к боту ограничен.")
+        return
+    if query.currency != "XTR":
+        bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел.")
+        return
+    unlock = parse_unlock_payload(query.invoice_payload)
+    if unlock is not None:
+        owner, card_id, price = unlock
+        card = db.get_card(card_id, user_id)
+        if owner != user_id or price != query.total_amount or card is None:
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел. Нажми кнопку ещё раз.")
+        elif not card["data"].get("trial"):
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Эта картища уже чистая — платить не нужно!")
+        else:
+            bot.answer_pre_checkout_query(query.id, ok=True)
+        return
+    parsed = parse_topup_payload(query.invoice_payload)
+    if parsed is None or parsed[0] != user_id or parsed[1] != query.total_amount:
+        bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел. Создай новый в меню пополнения.")
         return
     bot.answer_pre_checkout_query(query.id, ok=True)
 
@@ -1641,6 +1759,20 @@ def successful_payment(message):
     chat_id = message.chat.id
     if payment.currency != "XTR":
         logger.error("Неожиданная валюта платежа: %s", payment.currency)
+        return
+    unlock = parse_unlock_payload(payment.invoice_payload)
+    if unlock is not None:
+        # Звёзды сначала кладём в мешочек, потом сразу списываем за чистую картищу:
+        # если что-то пойдёт не так, они не потеряются, а останутся на балансе.
+        if not db.add_balance(chat_id, payment.total_amount, "topup", payment.telegram_payment_charge_id):
+            return  # этот платёж уже обработан
+        logger.info("Оплата чистой картищи %s от %s: %s⭐", unlock[1], chat_id, payment.total_amount)
+        status = unlock_card(chat_id, unlock[1])
+        if status != "ok":
+            send_screen(chat_id, "pouch",
+                        f"💰 <b>Звёзды в мешочке!</b> +{payment.total_amount}⭐\n"
+                        f"Картищу снять не вышло, поэтому звёзды остались у тебя: <b>{balance_text(chat_id)}</b>.",
+                        reply_markup=get_main_menu(chat_id))
         return
     parsed = parse_topup_payload(payment.invoice_payload)
     credit = parsed[2] if parsed and parsed[1] == payment.total_amount else payment.total_amount
@@ -1840,7 +1972,7 @@ def cb_deck(call):
             return
         # Доставка не была подтверждена — собираем карту заново из сохранённого арта.
         with RENDER_LOCK:
-            full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")))
+            full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")), tag=str(chat_id))
         src = photo_source(full)
         try:
             msg = tg_retry(bot.send_photo, chat_id, src, caption=caption, reply_markup=markup,
@@ -1855,7 +1987,7 @@ def cb_deck(call):
 
     # action == "edit"
     if card["data"].get("trial"):
-        bot.answer_callback_query(call.id, "Пробную картищу править нельзя — закажи чистую!", show_alert=True)
+        bot.answer_callback_query(call.id, "Сначала сними водяные знаки — кнопка «Чистая картища»!", show_alert=True)
         return
     if chat_id in busy_users:
         bot.answer_callback_query(call.id, "⏳ Лавк ещё рисует прошлую картищу!", show_alert=True)
@@ -2463,7 +2595,7 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
     """Собирает карту поверх арта, отправляет полную карту + карту в рамке и сохраняет в колоду."""
     trial = bool(card_data.get("trial"))
     with RENDER_LOCK:
-        full, card_only = render_card(art, card_data, trial=trial)
+        full, card_only = render_card(art, card_data, trial=trial, tag=str(chat_id))
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
     started = time.monotonic()
     try:
@@ -2499,13 +2631,13 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                                       "открой «📜 Мои картищи», она уже там.")
         if trial:
             note = ("🎁 <b>Это пробная картища</b> — поэтому на ней водяные знаки Лавка.\n"
-                    f"Чистая картища без надписей — {GENERATION_PRICE}⭐. Пополни мешочек и закажи настоящую!")
+                    f"Жми «Чистая картища» ниже — за {GENERATION_PRICE}⭐ Лавк сотрёт надписи с этой же картищи.")
         else:
             note = ("🃏 Картища легла в твою колоду — ищи её в «Моих картищах».\n"
                     "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
         # Главное меню — обычной клавиатурой, правка (или пополнение) — кнопкой под отдельным сообщением.
         bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
-        action = "Пополнить мешочек?" if trial else "Хочешь поменять фон или что-то поправить на арте?"
+        action = "Снять водяные знаки?" if trial else "Хочешь поменять фон или что-то поправить на арте?"
         bot.send_message(chat_id, f"✏️ {action}", reply_markup=card_markup({"id": card_id, "data": card_data}))
     except Exception:
         # Карта уже доставлена и сохранена — сбой подсказки не должен вызывать возврат звёзд.
