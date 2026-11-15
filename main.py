@@ -1396,9 +1396,6 @@ TRIBUTE = tribute.Tribute(os.getenv("TRIBUTE_API_KEY", "").strip(),
                           tribute.parse_products(os.getenv("TRIBUTE_PRODUCTS", "")),
                           tribute_purchase, tribute_refund)
 TRIBUTE_PORT = int(os.getenv("TRIBUTE_PORT", "8090"))
-TRIBUTE_HINT = ("\n\n💳 <b>Нет звёзд?</b> Плати рублями по СБП прямо в Telegram — через Tribute, официального "
-                "партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.")
-
 
 def add_tribute_buttons(markup):
     """Кнопки «картой / СБП» — товары Tribute, открываются прямо в Telegram."""
@@ -1416,32 +1413,77 @@ def pack_label(pay: int, credit: int) -> str:
     return f"{label} · −{discount}%" if discount > 0 else label
 
 
-def show_topup(chat_id: int):
+TERMS_LINE = "<i>Оплачивая, ты соглашаешься с условиями — /terms</i>"
+
+
+def topup_header(chat_id: int) -> str:
+    return ("💰 <b>Пополнить мешочек</b>\n\n"
+            f"Сейчас в мешочке: <b>{balance_text(chat_id)}</b>\n"
+            f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐ · 🎬 Анимация — {ANIM_PRICE}⭐\n\n")
+
+
+def topup_choice_screen(chat_id: int):
+    """Первый экран: чем платить. Без Tribute сразу показываем звёзды."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("⭐ Звёздами Telegram", callback_data="topmode:stars"),
+               types.InlineKeyboardButton("💳 Рублями по СБП", callback_data="topmode:rub"),
+               types.InlineKeyboardButton("🎟 Промокод", callback_data="promo"))
+    text = (topup_header(chat_id) + "<b>Чем будешь платить, человече?</b>\n"
+            "⭐ Звёзды — если они у тебя уже есть.\n"
+            "💳 Рубли — по СБП прямо в Telegram, звёзды упадут в мешочек сами.\n\n" + TERMS_LINE)
+    return text, markup
+
+
+def topup_stars_screen(chat_id: int):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(*[
         types.InlineKeyboardButton(pack_label(pay, credit), callback_data=f"topup:{pay}")
         for pay, credit in TOPUP_PACKS
     ])
-    add_tribute_buttons(markup)
     markup.row(
         types.InlineKeyboardButton("✍️ Своя сумма", callback_data="topup:custom"),
         types.InlineKeyboardButton("🎟 Промокод", callback_data="promo"),
     )
+    if TRIBUTE.enabled:
+        markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="topmode:back"))
     packs = "\n".join(
         f"• <b>{pay}⭐</b> → {credit}⭐ в мешочек ({plural_cards(credit // GENERATION_PRICE)})"
         for pay, credit in TOPUP_PACKS
     )
-    send_screen(
-        chat_id, "topup",
-        "💰 <b>Пополнить мешочек</b>\n\n"
-        f"Сейчас в мешочке: <b>{balance_text(chat_id)}</b>\n"
-        f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐ · 🎬 Анимация — {ANIM_PRICE}⭐\n\n"
-        f"Чем больше набор, тем щедрее Лавк:\n{packs}\n\n"
-        "Или впиши свою сумму — звёзды зачислятся один к одному."
-        + (TRIBUTE_HINT if TRIBUTE.enabled else "") + "\n"
-        "<i>Оплачивая, ты соглашаешься с условиями — /terms</i>",
-        reply_markup=markup,
-    )
+    text = (topup_header(chat_id) + f"⭐ <b>Звёздами.</b> Чем больше набор, тем щедрее Лавк:\n{packs}\n\n"
+            "Или впиши свою сумму — звёзды зачислятся один к одному.\n" + TERMS_LINE)
+    return text, markup
+
+
+def topup_rub_screen(chat_id: int):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    add_tribute_buttons(markup)
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="topmode:back"))
+    text = (topup_header(chat_id) + "💳 <b>Рублями по СБП.</b> Оплата прямо в Telegram через Tribute — "
+            "официального партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.\n"
+            "Чем больше набор, тем дешевле звезда.\n\n" + TERMS_LINE)
+    return text, markup
+
+
+def show_topup(chat_id: int):
+    text, markup = topup_choice_screen(chat_id) if TRIBUTE.enabled else topup_stars_screen(chat_id)
+    send_screen(chat_id, "topup", text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("topmode:"))
+def cb_topmode(call):
+    chat_id = call.message.chat.id
+    safe_call(bot.answer_callback_query, call.id)
+    mode = call.data.split(":", 1)[1]
+    if mode == "rub" and TRIBUTE.enabled:
+        text, markup = topup_rub_screen(chat_id)
+    elif mode == "stars" or not TRIBUTE.enabled:
+        text, markup = topup_stars_screen(chat_id)
+    else:
+        text, markup = topup_choice_screen(chat_id)
+    # Меняем тот же экран, а не шлём новый — меню не разрастается.
+    if edit_screen(chat_id, call.message, text, reply_markup=markup) is None:
+        send_screen(chat_id, "topup", text, reply_markup=markup)
 
 
 def send_topup_invoice(chat_id: int, pay: int, credit: int):
