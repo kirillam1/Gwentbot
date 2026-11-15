@@ -73,7 +73,7 @@ GENERATION_PRICE = 100
 EDIT_PRICE = 50
 REFERRAL_BONUS = 50
 # (сколько платит, сколько звёзд падает в мешочек) — чем больше набор, тем выгоднее
-TOPUP_PACKS = ((100, 100), (190, 200), (270, 300), (700, 1000))
+TOPUP_PACKS = ((100, 100), (190, 200), (360, 400), (700, 1000))
 TOPUP_MIN, TOPUP_MAX = 1, 10000
 CARDS_PER_PAGE = 6
 ART_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "arts")   # чистые арты — исходники для правок
