@@ -16,10 +16,10 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-echo "==> Ставлю Python и git"
+echo "==> Ставлю Python, git и ffmpeg"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git ca-certificates >/dev/null
+apt-get install -y -qq python3 python3-venv python3-pip git ca-certificates ffmpeg >/dev/null
 
 id lavk >/dev/null 2>&1 || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin lavk
 mkdir -p "$DATA_DIR"

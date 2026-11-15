@@ -282,6 +282,28 @@ class Database:
     def count_cards(self, user_id: int) -> int:
         return self._scalar("SELECT COUNT(*) FROM cards WHERE user_id = ?", (user_id,))
 
+    def update_card_data(self, card_id: int, data: dict):
+        with self.lock, self.conn:
+            self.conn.execute("UPDATE cards SET data = ? WHERE id = ?", (json.dumps(data, ensure_ascii=False), card_id))
+
+    # ---------- для админки: генерации всех бойцов ----------
+    def get_card_any(self, card_id: int):
+        return self._card(self._one(
+            "SELECT c.*, u.username, u.first_name FROM cards c LEFT JOIN users u ON u.user_id = c.user_id "
+            "WHERE c.id = ?", (card_id,)))
+
+    def recent_cards(self, offset: int, limit: int, user_id: Optional[int] = None):
+        where, params = ("WHERE c.user_id = ?", (user_id,)) if user_id is not None else ("", ())
+        rows = self._all(
+            "SELECT c.*, u.username, u.first_name FROM cards c LEFT JOIN users u ON u.user_id = c.user_id "
+            f"{where} ORDER BY c.id DESC LIMIT ? OFFSET ?", params + (limit, offset))
+        return [self._card(row) for row in rows]
+
+    def count_all_cards(self, user_id: Optional[int] = None) -> int:
+        if user_id is not None:
+            return self.count_cards(user_id)
+        return self._scalar("SELECT COUNT(*) FROM cards")
+
     # ---------- статистика ----------
     def stats(self) -> dict:
         day = today()
@@ -292,6 +314,9 @@ class Database:
             "unlimited": self._scalar("SELECT COUNT(*) FROM users WHERE unlimited = 1"),
             "cards": self._scalar("SELECT COUNT(*) FROM cards"),
             "cards_today": self._scalar("SELECT COUNT(*) FROM cards WHERE created_at >= ?", (day,)),
+            "anims": self._scalar("SELECT COUNT(*) FROM transactions WHERE kind = 'animation'"),
+            "anims_today": self._scalar(
+                "SELECT COUNT(*) FROM transactions WHERE kind = 'animation' AND created_at >= ?", (day,)),
             "stars": self._scalar("SELECT SUM(amount) FROM transactions WHERE kind = 'topup'"),
             "stars_today": self._scalar(
                 "SELECT SUM(amount) FROM transactions WHERE kind = 'topup' AND created_at >= ?", (day,)

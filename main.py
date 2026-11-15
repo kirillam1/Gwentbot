@@ -26,6 +26,7 @@ from google.genai import types as genai_types
 from telebot import apihelper, types
 from telebot.handler_backends import BaseMiddleware, CancelUpdate
 
+import card_video
 from card_render import LABEL_RE, render_card, strip_markup
 from db import Database
 
@@ -75,6 +76,23 @@ TOPUP_PACKS = ((100, 100), (190, 200), (270, 300), (700, 1000))
 TOPUP_MIN, TOPUP_MAX = 1, 10000
 CARDS_PER_PAGE = 6
 ART_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "arts")   # чистые арты — исходники для правок
+VIDEO_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "videos")  # готовые анимированные картищи
+
+# ---------- анимированная картища ----------
+ANIM_PRICE = int(os.getenv("ANIM_PRICE", "300"))
+# Veo 3.1 (Google) — видео со звуком из картинки. Ключ тот же FAL_API_KEY.
+# Дешевле в ~2,7 раза: VIDEO_MODEL=fal-ai/veo3.1/fast/image-to-video
+VIDEO_MODEL = os.getenv("VIDEO_MODEL", "fal-ai/veo3.1/image-to-video")
+VIDEO_ENDPOINT = f"https://queue.fal.run/{VIDEO_MODEL}"
+VIDEO_DURATION = os.getenv("VIDEO_DURATION", "6s")    # у Veo: 4s, 6s или 8s
+VIDEO_RESOLUTION = "1080p"                             # у Veo 720p и 1080p стоят одинаково
+VIDEO_DEADLINE = 480                                   # секунд на ролик (обычно 1–3 мин)
+
+# ---------- срок хранения ----------
+# Чистые арты и видео на диске живут столько дней, потом стираются (картищи в колоде остаются —
+# они хранятся в Telegram). После срока картищу нельзя править, оживить или очистить от знаков.
+CARD_TTL_DAYS = float(os.getenv("CARD_TTL_DAYS", "5"))
+ADMIN_FEED_PAGE = 8
 
 if not BOT_TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
@@ -634,7 +652,10 @@ def card_markup(card: dict, with_deck: bool = False):
         markup.add(types.InlineKeyboardButton(f"🎨 Чистая картища — {GENERATION_PRICE}⭐",
                                               callback_data=f"unlock:{card['id']}"))
     else:
-        markup.add(types.InlineKeyboardButton(f"✏️ Правка — {EDIT_PRICE}⭐", callback_data=f"edit:{card['id']}"))
+        markup.row(types.InlineKeyboardButton(f"✏️ Правка — {EDIT_PRICE}⭐", callback_data=f"edit:{card['id']}"),
+                   types.InlineKeyboardButton(f"🎬 Оживить — {ANIM_PRICE}⭐", callback_data=f"anim:{card['id']}"))
+        if card["data"].get("video_file_id"):
+            markup.add(types.InlineKeyboardButton("▶️ Смотреть живую картищу", callback_data=f"vid:{card['id']}"))
     if with_deck:
         markup.add(types.InlineKeyboardButton("📜 К колоде", callback_data="deck:0"))
     return markup
@@ -1355,7 +1376,7 @@ def show_topup(chat_id: int):
         chat_id, "topup",
         "💰 <b>Пополнить мешочек</b>\n\n"
         f"Сейчас в мешочке: <b>{balance_text(chat_id)}</b>\n"
-        f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐\n\n"
+        f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐ · 🎬 Анимация — {ANIM_PRICE}⭐\n\n"
         f"Чем больше набор, тем щедрее Лавк:\n{packs}\n\n"
         "Или впиши свою сумму — звёзды зачислятся один к одному.\n"
         "<i>Оплачивая, ты соглашаешься с условиями — /terms</i>",
@@ -1479,13 +1500,15 @@ def cmd_terms(message):
         message.chat.id, "terms",
         "📜 <b>Условия пещеры Лавка</b>\n\n"
         "1. Звёзды, внесённые в мешочек, тратятся на создание картищ "
-        f"({GENERATION_PRICE}⭐) и правки ({EDIT_PRICE}⭐).\n"
+        f"({GENERATION_PRICE}⭐), правки ({EDIT_PRICE}⭐) и анимацию картищ ({ANIM_PRICE}⭐).\n"
         "2. Если генерация не удалась по вине бота, звёзды автоматически возвращаются в мешочек.\n"
         f"3. Первая картища бесплатна, но выдаётся с водяными знаками; снять их можно за {GENERATION_PRICE}⭐. "
         "Пробную картищу нельзя править, пока она с водяными знаками.\n"
         "4. Картищи — фан-арт по мотивам GWENT, бот не связан с CD PROJEKT RED.\n"
         "5. Не присылай чужие фото без согласия их владельца.\n"
-        f"6. Вопросы по оплате и возвраты — /paysupport или {SUPPORT_CONTACT}.",
+        f"6. Вопросы по оплате и возвраты — /paysupport или {SUPPORT_CONTACT}.\n"
+        f"7. Исходники картищ Лавк хранит {plural_days(CARD_TTL_DAYS)}: потом картища остаётся в колоде, "
+        "но её уже нельзя править, оживить или очистить от водяных знаков.",
     )
 
 
@@ -1621,12 +1644,16 @@ def parse_topup_payload(payload: str) -> Optional[tuple[int, int, int]]:
     return user_id, pay, credit
 
 
-def parse_unlock_payload(payload: str) -> Optional[tuple[int, int, int]]:
-    """(user_id, card_id, цена) из счёта «Чистая картища»."""
+def parse_card_payload(payload: str, kind: str) -> Optional[tuple[int, int, int]]:
+    """(user_id, card_id, цена) из счёта на картищу: kind = unlock («Чистая картища») или anim (анимация)."""
     parts = payload.split(":")
-    if parts[0] != "unlock" or len(parts) != 4 or not all(p.isdigit() for p in parts[1:]):
+    if parts[0] != kind or len(parts) != 4 or not all(p.isdigit() for p in parts[1:]):
         return None
     return int(parts[1]), int(parts[2]), int(parts[3])
+
+
+def parse_unlock_payload(payload: str) -> Optional[tuple[int, int, int]]:
+    return parse_card_payload(payload, "unlock")
 
 
 # ---------- «Чистая картища»: снять водяные знаки с пробной ----------
@@ -1716,8 +1743,7 @@ def cb_unlock(call):
                   show_alert=True)
     elif status == "no_art":
         safe_call(bot.answer_callback_query, call.id)
-        bot.send_message(chat_id, f"😔 У этой старой картищи не сохранился чистый арт. Напиши {SUPPORT_CONTACT} — "
-                                  "Лавк поможет вручную.")
+        bot.send_message(chat_id, f"😔 {expired_text()}")
     else:  # no_money — сразу выставляем счёт именно на чистую картищу
         safe_call(bot.answer_callback_query, call.id)
         bot.send_message(chat_id, f"💸 В мешочке {balance_of(chat_id)}⭐, а нужно {GENERATION_PRICE}⭐.\n"
@@ -1734,6 +1760,23 @@ def pre_checkout(query):
         return
     if query.currency != "XTR":
         bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел.")
+        return
+    anim = parse_card_payload(query.invoice_payload, "anim")
+    if anim is not None:
+        owner, card_id, price = anim
+        card = db.get_card(card_id, user_id)
+        # «Занят прошлой картищей» оплату не блокирует: звёзды просто лягут в мешочек.
+        reason = None
+        if card is not None and card["data"].get("trial"):
+            reason = "Сначала сними водяные знаки — кнопка «Чистая картища»!"
+        elif card is not None and not has_clean_art(card):
+            reason = expired_text()
+        if owner != user_id or price != query.total_amount or card is None:
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел. Нажми «Оживить» ещё раз.")
+        elif reason:
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message=reason[:200])
+        else:
+            bot.answer_pre_checkout_query(query.id, ok=True)
         return
     unlock = parse_unlock_payload(query.invoice_payload)
     if unlock is not None:
@@ -1759,6 +1802,22 @@ def successful_payment(message):
     chat_id = message.chat.id
     if payment.currency != "XTR":
         logger.error("Неожиданная валюта платежа: %s", payment.currency)
+        return
+    anim = parse_card_payload(payment.invoice_payload, "anim")
+    if anim is not None:
+        # Как с чистой картищей: звёзды сначала в мешочек, потом сразу списание за анимацию.
+        if not db.add_balance(chat_id, payment.total_amount, "topup", payment.telegram_payment_charge_id):
+            return
+        logger.info("Оплата анимации картищи %s от %s: %s⭐", anim[1], chat_id, payment.total_amount)
+        reason = anim_blocker(chat_id, db.get_card(anim[1], chat_id))
+        if reason is None and charge(chat_id, ANIM_PRICE, "animation") is not None:
+            start_animation(chat_id, anim[1], "free" if is_free(chat_id) else "paid")
+        else:
+            send_screen(chat_id, "pouch",
+                        f"💰 <b>Звёзды в мешочке!</b> +{payment.total_amount}⭐\n"
+                        f"{esc(reason or '')}\nЗвёзды остались у тебя: <b>{balance_text(chat_id)}</b> — "
+                        "нажми «🎬 Оживить» ещё раз, когда будешь готов.",
+                        reply_markup=get_main_menu(chat_id))
         return
     unlock = parse_unlock_payload(payment.invoice_payload)
     if unlock is not None:
@@ -1971,6 +2030,10 @@ def cb_deck(call):
             bot.send_photo(chat_id, card["file_id"], caption=caption, reply_markup=markup)
             return
         # Доставка не была подтверждена — собираем карту заново из сохранённого арта.
+        if not has_clean_art(card):
+            bot.send_message(chat_id, caption + "\n\n😔 Эта картища не дошла, а её исходник уже стёрт по сроку. "
+                                                f"Напиши {SUPPORT_CONTACT} — Лавк разберётся.", reply_markup=markup)
+            return
         with RENDER_LOCK:
             full, _ = render_card(load_art(card), card["data"], trial=bool(card["data"].get("trial")), tag=str(chat_id))
         src = photo_source(full)
@@ -1988,6 +2051,9 @@ def cb_deck(call):
     # action == "edit"
     if card["data"].get("trial"):
         bot.answer_callback_query(call.id, "Сначала сними водяные знаки — кнопка «Чистая картища»!", show_alert=True)
+        return
+    if not has_clean_art(card):
+        bot.answer_callback_query(call.id, expired_text(), show_alert=True)
         return
     if chat_id in busy_users:
         bot.answer_callback_query(call.id, "⏳ Лавк ещё рисует прошлую картищу!", show_alert=True)
@@ -2150,8 +2216,8 @@ def is_blank(image: bytes) -> bool:
         return True
 
 
-def request_fal_image(endpoint: str, payload: dict, check_blank: bool = True) -> bytes:
-    """Генерация через очередь Fal: запрос не висит на одном соединении, есть общий дедлайн."""
+def fal_queue(endpoint: str, payload: dict, deadline_s: int = FAL_DEADLINE) -> dict:
+    """Задача через очередь Fal: запрос не висит на одном соединении, есть общий дедлайн. Возвращает ответ модели."""
     if not FAL_KEY:
         raise FalError("не задан FAL_API_KEY")
     headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
@@ -2160,7 +2226,7 @@ def request_fal_image(endpoint: str, payload: dict, check_blank: bool = True) ->
         logger.error("Fal.ai %s: %s", response.status_code, response.text[:1000])
         raise FalError(f"Fal.ai вернул код {response.status_code}", retryable=response.status_code >= 500)
     job = response.json()
-    deadline = time.monotonic() + FAL_DEADLINE
+    deadline = time.monotonic() + deadline_s
     while True:
         if time.monotonic() > deadline:
             logger.error("Fal.ai: истёк дедлайн для %s", job.get("request_id"))
@@ -2181,10 +2247,22 @@ def request_fal_image(endpoint: str, payload: dict, check_blank: bool = True) ->
     try:
         result.raise_for_status()
         body = result.json()
-        image_url = fal_image_url(body)
-    except (requests.HTTPError, ValueError, KeyError, IndexError, TypeError):
+    except (requests.HTTPError, ValueError):
+        # 422 здесь — чаще всего отказ фильтра модели; повтор того же запроса не поможет.
         logger.error("Неожиданный ответ Fal.ai: %s %s", result.status_code, result.text[:1000])
-        raise FalError("Fal.ai вернул ответ без картинки", retryable=result.status_code >= 500)
+        raise FalError("Fal.ai вернул ошибку", retryable=result.status_code >= 500)
+    body["_request_id"] = job.get("request_id")
+    return body
+
+
+def request_fal_image(endpoint: str, payload: dict, check_blank: bool = True) -> bytes:
+    body = fal_queue(endpoint, payload)
+    job = {"request_id": body.get("_request_id")}
+    try:
+        image_url = fal_image_url(body)
+    except (ValueError, KeyError, IndexError, TypeError):
+        logger.error("Неожиданный ответ Fal.ai: %s", str(body)[:1000])
+        raise FalError("Fal.ai вернул ответ без картинки")
     art = http_retry("GET", image_url, timeout=90)
     if not art.ok:
         raise FalError("не удалось скачать картинку", retryable=True)
@@ -2572,6 +2650,56 @@ def art_path(card_id: int) -> str:
     return os.path.join(ART_DIR, f"{card_id}.jpg")
 
 
+# ---------- срок хранения исходников ----------
+def plural_days(n: float) -> str:
+    n = int(n) if float(n).is_integer() else n
+    if isinstance(n, float):
+        return f"{n} дня"
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} дня"
+    return f"{n} дней"
+
+
+def expired_text() -> str:
+    return (f"Исходник этой картищи уже стёрт — Лавк хранит их {plural_days(CARD_TTL_DAYS)}. "
+            "Сама картища осталась в колоде, а для правок и анимации закажи новую!")
+
+
+def cleanup_old_files() -> tuple[int, int]:
+    """Стирает арты и видео старше CARD_TTL_DAYS. Возвращает (сколько файлов, сколько байт)."""
+    cutoff = time.time() - CARD_TTL_DAYS * 86400
+    removed = freed = 0
+    for folder in (ART_DIR, VIDEO_DIR):
+        try:
+            entries = list(os.scandir(folder))
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    size = entry.stat().st_size
+                    os.remove(entry.path)
+                    removed += 1
+                    freed += size
+            except OSError:
+                logger.exception("Не удалось удалить %s", entry.path)
+    if removed:
+        logger.info("Чистка: удалено %s файлов старше %s дн., освобождено %.1f МБ",
+                    removed, CARD_TTL_DAYS, freed / 1e6)
+    return removed, freed
+
+
+def cleanup_loop():
+    while True:
+        try:
+            cleanup_old_files()
+        except Exception:
+            logger.exception("Ошибка чистки старых файлов")
+        time.sleep(3600)
+
+
 def save_art(card_id: int, art: bytes):
     try:
         os.makedirs(ART_DIR, exist_ok=True)
@@ -2637,7 +2765,9 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                     "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
         # Главное меню — обычной клавиатурой, правка (или пополнение) — кнопкой под отдельным сообщением.
         bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
-        action = "Снять водяные знаки?" if trial else "Хочешь поменять фон или что-то поправить на арте?"
+        action = ("Снять водяные знаки?" if trial
+                  else f"Поправить арт или оживить картищу — с движением и звуком?\n"
+                       f"<i>Правки и анимация доступны {plural_days(CARD_TTL_DAYS)} — потом исходник стирается.</i>")
         bot.send_message(chat_id, f"✏️ {action}", reply_markup=card_markup({"id": card_id, "data": card_data}))
     except Exception:
         # Карта уже доставлена и сохранена — сбой подсказки не должен вызывать возврат звёзд.
@@ -2940,6 +3070,251 @@ def edit_card(chat_id: int, card: dict, instruction: str, mode: str, preset: Opt
 
 
 # ==========================================
+# 13б. АНИМИРОВАННАЯ КАРТИЩА (Veo 3.1 со звуком)
+# ==========================================
+# Движение и звук по фракциям: (что шевелится в кадре, как звучит).
+FACTION_ANIMATION = {
+    "Нильфгаард": (
+        "black and gold banners with the golden sun ripple slowly in the wind, campfire embers and ash drift "
+        "through the air, the polished black plate armor catches flickering firelight",
+        "distant war drums, crackling campfires, the clink of armor and a low imperial horn far away"),
+    "Чудовища": (
+        "thick green fog crawls and swirls, twisted trees creak and sway, faint glowing eyes blink in the mist, "
+        "the toxic swamp water slowly bubbles",
+        "eerie swamp ambience, a low monstrous growl, bubbling water, distant howling and buzzing insects"),
+    "Скеллиге": (
+        "storm wind whips hair and fur cloaks, heavy rain falls, sea spray bursts from waves crashing against "
+        "the cliffs, dark storm clouds roll, a faint lightning flash",
+        "howling sea wind, crashing waves, heavy rain, a distant thunder roll and a deep nordic war horn"),
+    "Королевства Севера": (
+        "blue and silver royal banners flutter, sunlight glints across polished steel armor, dust and ash drift, "
+        "arrows streak high in the distant sky",
+        "distant battle sounds behind castle walls, banners flapping, a heroic trumpet call, clanking steel"),
+    "Синдикат": (
+        "wall lanterns flicker, light rain falls and ripples in the puddles on the cobblestones, smoke curls, "
+        "a gold coin glints, shadows shift in the alley",
+        "rain on cobblestones, a creaking lantern, coins clinking, muffled city sounds of Novigrad at night"),
+    "Скоя'таэли": (
+        "sunbeams shift through the canopy, golden leaves and glowing pollen drift down, moss and ferns sway, "
+        "magical flora glows softly",
+        "a peaceful ancient forest, birdsong, rustling leaves, a gentle breeze and a soft elven flute"),
+    "Нейтральная": (
+        "candle and fire light flickers across the face and leather armor, smoke and dust drift in warm light, "
+        "the silver medallion glints",
+        "a cozy medieval tavern: crackling fire, muffled chatter, mugs clinking and a lute playing softly"),
+}
+ANIM_BASE_PROMPT = (
+    "Bring this dark fantasy trading card artwork to life as a short living portrait. "
+    "The camera is locked off with only a very slow, subtle push-in. "
+    "The character stays in the same place and pose and keeps exactly the same face, identity, outfit and "
+    "painterly digital oil painting style. Natural subtle motion: calm breathing, blinking, a slight head "
+    "movement, hair and cloth moving gently. {subject} The environment comes alive: {environment}. "
+    "Smooth continuous motion, one single shot, no cuts. "
+    "Audio: {sound}. No dialogue, no speech, no narration, no singing."
+)
+ANIM_NEGATIVE = ("text, letters, subtitles, watermark, logo, scene cut, camera shake, fast camera movement, zoom out, "
+                 "new characters, face morphing, changing face, distorted face, extra limbs, cartoon, 3d render, "
+                 "photorealistic, low quality")
+
+
+def animation_prompt(data: dict, art: bytes) -> str:
+    environment, sound = FACTION_ANIMATION.get(data.get("faction"), FACTION_ANIMATION["Нейтральная"])
+    subject = ""
+    # Gemini смотрит на сам арт и подсказывает, что именно в нём может двигаться (оружие, плащ, магия…).
+    answer = ask_gemini_vision(
+        as_jpeg(art),
+        "You direct a 6-second subtle animation of this fantasy card art. Reply with JSON "
+        '{"subject": "..."} — one English sentence (max 30 words) describing natural, subtle movements of the '
+        "character and the objects they hold or wear that fit this exact image (e.g. glowing magic pulsing, "
+        "a cloak swaying, fingers tightening on a sword hilt). Do not describe the background. "
+        "Do not change the pose or the face.",
+        as_json=True,
+    ) if GEMINI_API_KEY else None
+    if isinstance(answer, dict) and isinstance(answer.get("subject"), str):
+        subject = answer["subject"].strip()[:300]
+        if subject and not subject.endswith("."):
+            subject += "."
+    return ANIM_BASE_PROMPT.format(subject=subject, environment=environment, sound=sound)
+
+
+def video_path(card_id: int) -> str:
+    return os.path.join(VIDEO_DIR, f"{card_id}.mp4")
+
+
+def generate_video(source_jpeg: bytes, prompt: str) -> bytes:
+    image_url = fal_upload(source_jpeg, name="anim_source.jpg") or to_data_uri(source_jpeg, "image/jpeg")
+    payload = {
+        "prompt": prompt, "negative_prompt": ANIM_NEGATIVE, "image_url": image_url,
+        "aspect_ratio": "9:16", "duration": VIDEO_DURATION, "resolution": VIDEO_RESOLUTION,
+        "generate_audio": True, "auto_fix": True, "safety_tolerance": FAL_SAFETY,
+    }
+    try:
+        body = fal_queue(VIDEO_ENDPOINT, payload, VIDEO_DEADLINE)
+    except FalError as e:
+        if not e.retryable:
+            raise
+        logger.warning("Видео: %s — пробую ещё раз", e)
+        body = fal_queue(VIDEO_ENDPOINT, payload, VIDEO_DEADLINE)
+    try:
+        url = body["video"]["url"]
+    except (KeyError, TypeError):
+        logger.error("Fal.ai вернул ответ без видео: %s", str(body)[:1000])
+        raise FalError("духи не прислали видео")
+    response = http_retry("GET", url, timeout=180)
+    if not response.ok or len(response.content) < 10_000:
+        raise FalError("не удалось скачать видео", retryable=True)
+    return response.content
+
+
+def send_card_video(chat_id: int, video, caption: str, reply_markup=None):
+    width, height = card_video.video_size()
+    return tg_retry(bot.send_video, chat_id, video, caption=caption, reply_markup=reply_markup,
+                    width=width, height=height, supports_streaming=True, timeout=MEDIA_TIMEOUT)
+
+
+def animate_card(chat_id: int, card_id: int, mode: str):
+    def job(status):
+        card = db.get_card(card_id, chat_id)
+        if card is None or not has_clean_art(card):
+            raise FalError("исходник картищи уже стёрт")
+        art = load_art(card)
+        source, window = card_video.video_source_image(art)
+        prompt = animation_prompt(card["data"], art)
+        logger.info("Анимация картищи %s для %s: %s", card_id, chat_id, prompt[:300])
+        started = time.monotonic()
+        raw = generate_video(source, prompt)
+        logger.info("Видео для картищи %s нарисовано за %.0f с", card_id, time.monotonic() - started)
+        with RENDER_LOCK:
+            overlay = card_video.card_overlay(card["data"])
+        mp4 = card_video.compose_card_video(raw, overlay, window)
+        try:
+            os.makedirs(VIDEO_DIR, exist_ok=True)
+            with open(video_path(card_id), "wb") as f:
+                f.write(mp4)
+        except OSError:
+            logger.exception("Не удалось сохранить видео картищи %s", card_id)
+
+        caption = (f"🎬 <b>КАРТИЩА ОЖИЛА!</b>\n«{esc(strip_markup(card['data'].get('name', '')))}» · "
+                   f"{esc(card['data'].get('faction', ''))}\n<i>Включи звук 🔊</i>")
+        source_url = fal_upload(mp4, content_type="video/mp4", name="card.mp4")
+        file_id = ""
+        try:
+            try:
+                msg = send_card_video(chat_id, source_url or mp4, caption)
+            except apihelper.ApiTelegramException as e:
+                if not source_url or not is_url_fetch_error(e):
+                    raise
+                msg = send_card_video(chat_id, mp4, caption)
+            file_id = msg.video.file_id
+        except (requests.ReadTimeout, requests.ConnectionError) as e:
+            # Как с картищами: видео почти наверняка дошло, повтор дал бы дубль.
+            logger.warning("Telegram не подтвердил доставку видео для %s: %s", chat_id, e.__class__.__name__)
+        safe_call(bot.delete_message, chat_id, status.message_id)
+        data = dict(card["data"], video_file_id=file_id)
+        db.update_card_data(card_id, data)
+        try:
+            if not file_id:
+                bot.send_message(chat_id, "📨 Telegram долго принимал видео. Если оно не пришло выше — "
+                                          "открой картищу в «📜 Мои картищи».")
+            bot.send_message(chat_id, "🃏 Живая картища лежит в твоей колоде.",
+                             reply_markup=card_markup(dict(card, data=data)))
+        except Exception:
+            logger.exception("Не удалось отправить подсказку после видео %s", card_id)
+
+    run_art_job(chat_id, ANIM_PRICE, mode, job)
+
+
+def start_animation(chat_id: int, card_id: int, mode: str):
+    busy_users.add(chat_id)
+    bot.send_message(chat_id, "🎬 <b>Лавк оживляет картищу!</b> Это дольше обычного — <b>2–4 минуты</b>. "
+                              "Видео придёт само.", reply_markup=get_main_menu(chat_id))
+    threading.Thread(target=animate_card, args=(chat_id, card_id, mode), daemon=True).start()
+
+
+def send_anim_invoice(chat_id: int, card_id: int):
+    try:
+        bot.send_invoice(
+            chat_id,
+            title="Живая картища",
+            description=f"Лавк оживит твою картищу: {VIDEO_DURATION[:-1]} секунд анимации со звуком в рамке карты.",
+            invoice_payload=f"anim:{chat_id}:{card_id}:{ANIM_PRICE}",
+            provider_token="",
+            currency="XTR",
+            prices=[types.LabeledPrice(label="Живая картища", amount=ANIM_PRICE)],
+        )
+    except apihelper.ApiTelegramException as e:
+        logger.error("Не удалось выставить счёт на анимацию %s: %s", card_id, e)
+        bot.send_message(chat_id, "⚠️ Telegram не принял счёт. Попробуй ещё раз или пополни мешочек в меню.")
+
+
+def anim_blocker(chat_id: int, card: Optional[dict]) -> Optional[str]:
+    """Почему эту картищу сейчас нельзя оживить (None — можно)."""
+    if card is None:
+        return "Такой картищи нет в твоей колоде."
+    if card["data"].get("trial"):
+        return "Сначала сними водяные знаки — кнопка «Чистая картища»!"
+    if not has_clean_art(card):
+        return expired_text()
+    if not card_video.ffmpeg_available():
+        logger.error("Анимация недоступна: на сервере нет ffmpeg (перезапусти install.sh)")
+        return "Мастерская анимации сейчас закрыта. Загляни позже!"
+    if chat_id in busy_users:
+        return "⏳ Лавк ещё рисует прошлую картищу!"
+    return None
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("anim:", "animgo:", "animno:", "vid:")))
+def cb_anim(call):
+    chat_id = call.message.chat.id
+    action, value = call.data.split(":", 1)
+    if not value.isdigit():
+        safe_call(bot.answer_callback_query, call.id)
+        return
+    card = db.get_card(int(value), chat_id)
+    if action == "animno":
+        safe_call(bot.answer_callback_query, call.id)
+        safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
+        return
+    if action == "vid":
+        if card is None or not card["data"].get("video_file_id"):
+            safe_call(bot.answer_callback_query, call.id, "Видео не нашлось.", show_alert=True)
+            return
+        safe_call(bot.answer_callback_query, call.id)
+        send_card_video(chat_id, card["data"]["video_file_id"],
+                        f"🎬 «{esc(strip_markup(card['data'].get('name', '')))}»", reply_markup=card_markup(card))
+        return
+
+    reason = anim_blocker(chat_id, card)
+    if reason:
+        safe_call(bot.answer_callback_query, call.id, reason, show_alert=True)
+        return
+    safe_call(bot.answer_callback_query, call.id)
+    if action == "anim":
+        price = "♾ для тебя бесплатно" if is_free(chat_id) else f"<b>{ANIM_PRICE}⭐</b> (в мешочке: {balance_of(chat_id)}⭐)"
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(types.InlineKeyboardButton("🎬 Оживить!", callback_data=f"animgo:{card['id']}"),
+                   types.InlineKeyboardButton("❌ Не надо", callback_data=f"animno:{card['id']}"))
+        bot.send_message(
+            chat_id,
+            f"🎬 <b>Живая картища</b>\n\nЛавк оживит «{esc(strip_markup(card['data'].get('name', '')))}»: "
+            f"{VIDEO_DURATION[:-1]} секунд анимации со звуком, прямо в рамке карты. "
+            "Движение и звуки — в духе фракции.\n\n"
+            f"Стоимость: {price}",
+            reply_markup=markup,
+        )
+        return
+    # animgo
+    safe_call(bot.edit_message_reply_markup, chat_id, call.message.message_id, reply_markup=None)
+    paid = charge(chat_id, ANIM_PRICE, "animation")
+    if paid is None:
+        bot.send_message(chat_id, f"💸 В мешочке {balance_of(chat_id)}⭐, а нужно {ANIM_PRICE}⭐.\n"
+                                  "Оплати счёт ниже — Лавк возьмётся за анимацию сразу после оплаты.")
+        send_anim_invoice(chat_id, card["id"])
+        return
+    start_animation(chat_id, card["id"], "paid" if paid else "free")
+
+
+# ==========================================
 # 14. АДМИНКА
 # ==========================================
 def admin_panel_markup():
@@ -2952,7 +3327,8 @@ def admin_panel_markup():
                types.InlineKeyboardButton("🎟 Промокоды", callback_data="adm:promo"))
     markup.add(types.InlineKeyboardButton("🎨 Картинки Лавка", callback_data="adm:scenes"),
                types.InlineKeyboardButton("🧪 Модель артов", callback_data="adm:models"))
-    markup.add(types.InlineKeyboardButton("♻️ Восстановить из копии", callback_data="adm:restore"))
+    markup.add(types.InlineKeyboardButton("🖼 Генерации бойцов", callback_data="adm:feed:0"),
+               types.InlineKeyboardButton("♻️ Восстановить из копии", callback_data="adm:restore"))
     return markup
 
 
@@ -3107,6 +3483,85 @@ def show_promos(chat_id: int):
     )
 
 
+# ---------- просмотр генераций бойцов ----------
+def card_kind_mark(card: dict) -> str:
+    data = card["data"]
+    if data.get("video_file_id"):
+        return "🎬"
+    if data.get("trial"):
+        return "🎁"
+    return "✏️" if card["parent_id"] else "🃏"
+
+
+def owner_label(card: dict) -> str:
+    if card.get("username"):
+        return f"@{card['username']}"
+    return card.get("first_name") or str(card["user_id"])
+
+
+def show_admin_feed(chat_id: int, page: int, user_id: Optional[int] = None, message=None):
+    """Лента последних генераций (всех бойцов или одного). Кнопка — открыть картищу целиком."""
+    total = db.count_all_cards(user_id)
+    pages = max(1, (total + ADMIN_FEED_PAGE - 1) // ADMIN_FEED_PAGE)
+    page = min(max(page, 0), pages - 1)
+    cards = db.recent_cards(page * ADMIN_FEED_PAGE, ADMIN_FEED_PAGE, user_id)
+    markup = types.InlineKeyboardMarkup()
+    for card in cards:
+        name = strip_markup(card["data"].get("name", "Без имени"))[:22]
+        when = card["created_at"][5:16].replace("T", " ")
+        markup.add(types.InlineKeyboardButton(f"{card_kind_mark(card)} {name} · {owner_label(card)} · {when}",
+                                              callback_data=f"adm:card:{card['id']}"))
+    prefix = f"adm:ufeed:{user_id}:" if user_id is not None else "adm:feed:"
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("◀️", callback_data=f"{prefix}{page - 1}"))
+    nav.append(types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(types.InlineKeyboardButton("▶️", callback_data=f"{prefix}{page + 1}"))
+    markup.row(*nav)
+    who = f"бойца <code>{user_id}</code>" if user_id is not None else "всех бойцов"
+    text = (f"🖼 <b>Генерации {who}</b> — всего {total}\n"
+            "🃏 картища · ✏️ правка · 🎁 пробная · 🎬 с анимацией\n\nСвежие сверху. Жми, чтобы посмотреть:")
+    if not total:
+        text = f"🖼 У {who} пока нет картищ."
+    if message is not None and safe_call(bot.edit_message_text, text, chat_id, message.message_id,
+                                         reply_markup=markup) is not None:
+        return
+    bot.send_message(chat_id, text, reply_markup=markup)
+
+
+def show_admin_card(chat_id: int, card_id: int):
+    card = db.get_card_any(card_id)
+    if card is None:
+        bot.send_message(chat_id, "🤷 Картища не найдена.")
+        return
+    data = card["data"]
+    caption = (
+        f"{card_kind_mark(card)} <b>{esc(strip_markup(data.get('name', '')))}</b> · {esc(data.get('faction', ''))}\n"
+        f"👤 {esc(owner_label(card))} (<code>{card['user_id']}</code>)\n"
+        f"📅 {card['created_at'][:16].replace('T', ' ')} UTC · #{card['id']}"
+        + (f" · правка #{card['parent_id']}" if card["parent_id"] else "")
+        + f"\n🧬 {esc(data.get('category', '—'))} · ⚔️ {esc(data.get('power', '—'))} · 🖼 {esc(data.get('frame', '—'))}"
+    )
+    if data.get("edit"):
+        caption += f"\n✏️ Правка: {esc(data['edit'])[:200]}"
+    caption += "\n💾 Исходник: " + ("есть" if os.path.exists(art_path(card_id)) else "стёрт по сроку")
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton("👤 Боец", callback_data=f"adm:user:{card['user_id']}"),
+               types.InlineKeyboardButton("🖼 Его картищи", callback_data=f"adm:ufeed:{card['user_id']}:0"))
+    if card["file_id"]:
+        bot.send_photo(chat_id, card["file_id"], caption=caption[:CAPTION_LIMIT], reply_markup=markup)
+    elif os.path.exists(art_path(card_id)):
+        with RENDER_LOCK:
+            full, _ = render_card(load_art(card), data, trial=bool(data.get("trial")), tag=str(card["user_id"]))
+        bot.send_photo(chat_id, full, caption=caption[:CAPTION_LIMIT], reply_markup=markup)
+    else:
+        bot.send_message(chat_id, caption + "\n\n<i>Картинка не была доставлена, а исходник уже стёрт.</i>",
+                         reply_markup=markup)
+    if data.get("video_file_id"):
+        safe_call(send_card_video, chat_id, data["video_file_id"], f"🎬 Анимация картищи #{card_id}")
+
+
 def show_admin_panel(chat_id: int):
     send_screen(chat_id, "admin", "👑 <b>Трон смотрителя пещеры</b>\n\nЧто делаем, господин?",
                 reply_markup=admin_panel_markup())
@@ -3135,7 +3590,8 @@ def admin_user_view(user_id: int):
         types.InlineKeyboardButton("♾ Забрать безлимит" if user["unlimited"] else "♾ Дать безлимит",
                                    callback_data=f"adm:unl:{user_id}"),
     )
-    markup.add(types.InlineKeyboardButton("💰 Начислить / списать", callback_data=f"adm:bal:{user_id}"))
+    markup.add(types.InlineKeyboardButton("💰 Начислить / списать", callback_data=f"adm:bal:{user_id}"),
+               types.InlineKeyboardButton("🖼 Его картищи", callback_data=f"adm:ufeed:{user_id}:0"))
     return text, markup
 
 
@@ -3198,9 +3654,18 @@ def cb_admin(call):
             f"👥 Бойцов: <b>{s['users']}</b> (сегодня +{s['users_today']})\n"
             f"🚫 Заблокировано: {s['blocked']} · ♾ Безлимит: {s['unlimited']}\n"
             f"🃏 Картищ: <b>{s['cards']}</b> (сегодня +{s['cards_today']})\n"
+            f"🎬 Заказов анимации: <b>{s['anims']}</b> (сегодня +{s['anims_today']})\n"
             f"⭐ Пополнено звёзд: <b>{s['stars']}</b> (сегодня +{s['stars_today']})\n"
             f"⏳ Рисуется сейчас: {_gen_active} из {GEN_SLOTS} · в очереди: {len(_gen_queue)}",
         )
+    elif action == "feed" and len(parts) == 3 and parts[2].isdigit():
+        show_admin_feed(chat_id, int(parts[2]), message=call.message if parts[2] != "0" else None)
+    elif action == "ufeed" and len(parts) == 4 and parts[2].lstrip("-").isdigit() and parts[3].isdigit():
+        show_admin_feed(chat_id, int(parts[3]), int(parts[2]), message=call.message if parts[3] != "0" else None)
+    elif action == "card" and len(parts) == 3 and parts[2].isdigit():
+        show_admin_card(chat_id, int(parts[2]))
+    elif action == "user" and len(parts) == 3 and parts[2].lstrip("-").isdigit():
+        send_admin_user(chat_id, int(parts[2]))
     elif action == "find":
         user_states[chat_id] = STATE_ADMIN_FIND
         bot.send_message(chat_id, "🔎 Пришли ID или @username бойца.", reply_markup=get_cancel_menu())
@@ -3626,6 +4091,10 @@ if __name__ == "__main__":
     logger.info("Lavk is listening as @%s...", bot_username())
     # Картинки экранов загружаются в Telegram заранее, в фоне — пользователи их не ждут.
     warm_scenes_async()
+    # Раз в час стираем исходники старше CARD_TTL_DAYS, чтобы не забился диск.
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+    if not card_video.ffmpeg_available():
+        logger.warning("На сервере нет ffmpeg — анимация картищ недоступна. Перезапусти install.sh")
     bot.infinity_polling(
         timeout=60,
         long_polling_timeout=30,
