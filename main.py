@@ -27,6 +27,7 @@ from telebot import apihelper, types
 from telebot.handler_backends import BaseMiddleware, CancelUpdate
 
 import card_video
+import tribute
 from card_render import LABEL_RE, render_card, strip_markup
 from db import Database
 
@@ -1361,6 +1362,55 @@ def show_invite(chat_id: int):
     send_screen(chat_id, "invite", text, reply_markup=markup)
 
 
+# ---------- оплата рублями через Tribute ----------
+def notify_admins(text: str):
+    for admin_id in ADMIN_IDS:
+        safe_call(bot.send_message, admin_id, text)
+
+
+def tribute_purchase(user_id: int, product_id: int, stars: int, charge_id: str):
+    if db.get_user(user_id) is None:
+        # Человек ни разу не запускал бота — начислять некуда. Деньги пришли, разбираемся вручную.
+        logger.error("Tribute: оплата от %s, но его нет в базе бота (товар %s, %s⭐)", user_id, product_id, stars)
+        notify_admins(f"⚠️ Tribute: оплата {stars}⭐ от <code>{user_id}</code>, но его нет в базе бота. "
+                      "Начисли вручную, когда он зайдёт.")
+        return
+    if not db.add_balance(user_id, stars, "tribute", charge_id):
+        logger.info("Tribute: платёж %s уже зачислен", charge_id)
+        return
+    logger.info("Tribute: +%s⭐ пользователю %s (товар %s)", stars, user_id, product_id)
+    safe_call(send_screen, user_id, "pouch",
+              f"💰 <b>Оплата прошла!</b> +{stars}⭐ в мешочек.\n"
+              f"Теперь у тебя: <b>{balance_text(user_id)}</b>. Лавк уже точит кисть!",
+              reply_markup=get_main_menu(user_id))
+    notify_admins(f"💳 Tribute: +{stars}⭐ пользователю <code>{user_id}</code>")
+
+
+def tribute_refund(user_id: int, product_id: int, stars: int, charge_id: str):
+    if db.get_user(user_id) is not None and db.add_balance(user_id, -stars, "tribute_refund", charge_id):
+        logger.warning("Tribute: возврат, списано до %s⭐ у %s (товар %s)", stars, user_id, product_id)
+        notify_admins(f"↩️ Tribute: возврат платежа {stars}⭐ у <code>{user_id}</code> — звёзды списаны")
+
+
+TRIBUTE = tribute.Tribute(os.getenv("TRIBUTE_API_KEY", "").strip(),
+                          tribute.parse_products(os.getenv("TRIBUTE_PRODUCTS", "")),
+                          tribute_purchase, tribute_refund)
+TRIBUTE_PORT = int(os.getenv("TRIBUTE_PORT", "8090"))
+TRIBUTE_HINT = ("\n\n💳 <b>Нет звёзд?</b> Плати рублями — картой или СБП через Tribute, официального партнёра "
+                "Telegram. При первой оплате Telegram спросит разрешение на вход — нажми «Войти». "
+                "Звёзды упадут в мешочек сами, сразу после оплаты.")
+
+
+def add_tribute_buttons(markup):
+    """Кнопки «картой / СБП» — товары Tribute, открываются прямо в Telegram."""
+    if not TRIBUTE.enabled:
+        return
+    for product_id, stars in sorted(TRIBUTE.products.items(), key=lambda kv: kv[1]):
+        price = TRIBUTE.price_label(product_id)
+        label = f"💳 {stars}⭐ за {price} — картой / СБП" if price else f"💳 {stars}⭐ — картой / СБП"
+        markup.add(types.InlineKeyboardButton(label, url=TRIBUTE.link(product_id)))
+
+
 def pack_label(pay: int, credit: int) -> str:
     label = f"{pay}⭐ → {plural_cards(credit // GENERATION_PRICE)}"
     discount = round(100 - pay * 100 / credit)
@@ -1373,6 +1423,7 @@ def show_topup(chat_id: int):
         types.InlineKeyboardButton(pack_label(pay, credit), callback_data=f"topup:{pay}")
         for pay, credit in TOPUP_PACKS
     ])
+    add_tribute_buttons(markup)
     markup.row(
         types.InlineKeyboardButton("✍️ Своя сумма", callback_data="topup:custom"),
         types.InlineKeyboardButton("🎟 Промокод", callback_data="promo"),
@@ -1387,7 +1438,8 @@ def show_topup(chat_id: int):
         f"Сейчас в мешочке: <b>{balance_text(chat_id)}</b>\n"
         f"🎨 Картища — {GENERATION_PRICE}⭐ · ✏️ Правка — {EDIT_PRICE}⭐ · 🎬 Анимация — {ANIM_PRICE}⭐\n\n"
         f"Чем больше набор, тем щедрее Лавк:\n{packs}\n\n"
-        "Или впиши свою сумму — звёзды зачислятся один к одному.\n"
+        "Или впиши свою сумму — звёзды зачислятся один к одному."
+        + (TRIBUTE_HINT if TRIBUTE.enabled else "") + "\n"
         "<i>Оплачивая, ты соглашаешься с условиями — /terms</i>",
         reply_markup=markup,
     )
@@ -4198,6 +4250,11 @@ if __name__ == "__main__":
     warm_scenes_async()
     # Раз в час стираем исходники старше CARD_TTL_DAYS, чтобы не забился диск.
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    if TRIBUTE.enabled:
+        TRIBUTE.serve(TRIBUTE_PORT)
+        TRIBUTE.price_label(0)  # подтянуть цены для кнопок заранее
+    elif os.getenv("TRIBUTE_API_KEY"):
+        logger.warning("Tribute: есть ключ, но TRIBUTE_PRODUCTS пуст — оплата рублями выключена")
     if not card_video.ffmpeg_available():
         logger.warning("На сервере нет ffmpeg — анимация картищ недоступна. Перезапусти install.sh")
     bot.infinity_polling(
