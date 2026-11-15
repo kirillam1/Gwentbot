@@ -114,6 +114,13 @@ class LogExceptions(telebot.ExceptionHandler):
 
 # По умолчанию у telebot 2 потока: одна медленная операция (загрузка фото, проверка подписки)
 # тормозила ответы всем остальным пользователям.
+# Свой Bot API сервер (telegram-bot-api в Docker): TG_API_BASE=http://127.0.0.1:8081 в /etc/lavk.env.
+# Пусто — обычный api.telegram.org. Перед переключением бота надо один раз разлогинить из облака (logOut).
+TG_API_BASE = (os.getenv("TG_API_BASE") or "").rstrip("/")
+if TG_API_BASE:
+    apihelper.API_URL = TG_API_BASE + "/bot{0}/{1}"
+    apihelper.FILE_URL = TG_API_BASE + "/file/bot{0}/{1}"
+    logger.info("Telegram Bot API: свой сервер %s", TG_API_BASE)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", use_class_middlewares=True, num_threads=8,
                       exception_handler=LogExceptions())
 # Без таймаута запрос к Gemini может висеть бесконечно и подвесить генерацию карты.
@@ -2402,12 +2409,18 @@ def download_telegram_file(file_id: str) -> bytes:
     last = None
     for attempt in range(1, 5):
         try:
+            base = TG_API_BASE or "https://api.telegram.org"
             with requests.Session() as s:
-                r = s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                           data={"file_id": file_id}, timeout=(10, 20))
+                # Свой сервер сначала сам качает файл из Telegram — ему нужно больше времени.
+                r = s.post(f"{base}/bot{BOT_TOKEN}/getFile",
+                           data={"file_id": file_id}, timeout=(10, 120 if TG_API_BASE else 20))
                 r.raise_for_status()
                 path = r.json()["result"]["file_path"]
-                f = s.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=(10, 60))
+                if path.startswith("/"):
+                    # Свой сервер в режиме --local отдаёт путь к файлу на диске (папка смонтирована в Docker).
+                    with open(path, "rb") as fh:
+                        return fh.read()
+                f = s.get(f"{base}/file/bot{BOT_TOKEN}/{path}", timeout=(10, 60))
                 f.raise_for_status()
                 return f.content
         except (requests.Timeout, requests.ConnectionError) as e:
