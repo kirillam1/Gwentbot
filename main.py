@@ -3120,19 +3120,19 @@ FACTION_ANIMATION = {
     "Нильфгаард": (
         "black and gold banners with the golden sun ripple slowly in the wind, campfire embers and ash drift "
         "through the air, the polished black plate armor catches flickering firelight",
-        "distant war drums, crackling campfires, the clink of armor and a low imperial horn far away"),
+        "crackling campfires, a soft wind, the light clink of armor and a low horn far away"),
     "Чудовища": (
-        "thick green fog crawls and swirls, twisted trees creak and sway, eyes watch from the mist, "
+        "thick green fog slowly swirls, twisted trees creak and sway, "
         "the toxic swamp water slowly bubbles",
-        "eerie swamp ambience, a low monstrous growl, bubbling water, distant howling and buzzing insects"),
+        "mysterious swamp ambience, bubbling water, a distant owl and buzzing insects"),
     "Скеллиге": (
         "storm wind whips hair and fur cloaks, heavy rain falls, sea spray bursts from waves crashing against "
         "the cliffs, dark storm clouds roll, a faint lightning flash",
         "howling sea wind, crashing waves, heavy rain, a distant thunder roll and a deep nordic war horn"),
     "Королевства Севера": (
-        "blue and silver royal banners flutter, sunlight glints across polished steel armor, dust and ash drift, "
-        "arrows streak high in the distant sky",
-        "distant battle sounds behind castle walls, banners flapping, a heroic trumpet call, clanking steel"),
+        "blue and silver royal banners flutter, sunlight glints across polished steel armor, dust drifts "
+        "in the light",
+        "wind over castle walls, banners flapping, a distant heroic trumpet call"),
     "Синдикат": (
         "wall lanterns flicker, light rain falls and ripples in the puddles on the cobblestones, smoke curls, "
         "a gold coin glints, shadows shift in the alley",
@@ -3147,10 +3147,10 @@ FACTION_ANIMATION = {
         "a cozy medieval tavern: crackling fire, muffled chatter, mugs clinking and a lute playing softly"),
 }
 ANIM_BASE_PROMPT = (
-    "Bring this dark fantasy trading card artwork to life as a short living portrait. "
+    "Bring this painted fantasy card illustration to life as a short, calm living picture. "
     "The camera is locked off with only a very slow, subtle push-in. "
-    "The character stays in the same place and pose and keeps exactly the same face, identity, outfit and "
-    "painterly digital oil painting style. Natural subtle motion: calm breathing, blinking, a slight head "
+    "The painted character stays in the same place and pose, with the same look, outfit and "
+    "painterly digital oil painting style. Gentle, peaceful motion: soft blinking, a slight head "
     "movement, hair and cloth moving gently. {subject} The environment comes alive: {environment}. "
     "Smooth continuous motion, one single shot, no cuts. The motion is a seamless loop: everything gently "
     "returns to exactly the starting frame at the end. "
@@ -3184,8 +3184,9 @@ def animation_prompt(data: dict, art: bytes) -> tuple[str, str]:
         "You direct a short, seamlessly looping subtle animation of this fantasy card art. Reply with JSON "
         '{"subject": "...", "magic": false}. '
         "subject — one English sentence (max 30 words) describing natural, subtle physical movements of the "
-        "character and the objects they hold or wear in this exact image (e.g. a cloak swaying, fingers "
-        "tightening on a sword hilt, a candle flame flickering). Do not describe the background. "
+        "character and the objects they hold or wear in this exact image (e.g. a cloak swaying, hair moving "
+        "in the wind, a candle flame flickering). Keep it calm and peaceful: no attacks, no violence, no blood, "
+        "do not describe the body. Do not describe the background. "
         "Do not change the pose or the face. "
         "magic — true ONLY if the image already clearly shows spellcasting, glowing runes or magical energy; "
         "otherwise false. If magic is false, describe no glow, sparks or energy at all.",
