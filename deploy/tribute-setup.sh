@@ -31,10 +31,16 @@ PY
 
 say "Шаг 1 из 5. Ключ API Tribute"
 echo "   Кабинет автора Tribute → ⋯ → Настройки → «Ключи API». Ключ при вставке НЕ будет виден — так и задумано."
+OLD_KEY="$(grep -E '^TRIBUTE_API_KEY=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
 KEY=""
 while [ -z "$KEY" ]; do
-  read -r -s -p "   Вставь ключ и нажми Enter: " KEY < /dev/tty; echo
+  if [ -n "$OLD_KEY" ]; then
+    read -r -s -p "   Вставь ключ (или просто Enter — оставить сохранённый): " KEY < /dev/tty; echo
+  else
+    read -r -s -p "   Вставь ключ и нажми Enter: " KEY < /dev/tty; echo
+  fi
   KEY="$(echo "$KEY" | tr -d '[:space:]')"
+  [ -z "$KEY" ] && [ -n "$OLD_KEY" ] && KEY="$OLD_KEY" && echo "   Оставляю сохранённый ключ."
 done
 
 say "Шаг 2 из 5. Товары"
@@ -61,6 +67,12 @@ for p in find_items(data):
     m = re.match(r"\s*(\d+)\s*(зв|⭐|star)", str(p.get("name", "")), re.I)
     if m and str(p.get("status", "approved")) != "rejected":
         pairs.append((int(m.group(1)), int(p["id"]), p.get("name"), p.get("amount"), p.get("currency")))
+# Если товаров на одно число звёзд несколько (старый и новый) — берём самый новый (больший id).
+newest = {}
+for stars, pid, *rest in pairs:
+    if stars not in newest or pid > newest[stars][1]:
+        newest[stars] = (stars, pid, *rest)
+pairs = list(newest.values())
 for stars, pid, name, amount, cur in sorted(pairs):
     price = f"{int(amount)/100:.0f} {cur}" if isinstance(amount, (int, float)) else "?"
     print(f"   • {name} — {price} → {stars}⭐ (товар {pid})", file=sys.stderr)

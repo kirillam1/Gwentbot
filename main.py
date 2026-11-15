@@ -1396,8 +1396,8 @@ TRIBUTE = tribute.Tribute(os.getenv("TRIBUTE_API_KEY", "").strip(),
                           tribute.parse_products(os.getenv("TRIBUTE_PRODUCTS", "")),
                           tribute_purchase, tribute_refund)
 TRIBUTE_PORT = int(os.getenv("TRIBUTE_PORT", "8090"))
-TRIBUTE_HINT = ("\n\n💳 <b>Нет звёзд?</b> Плати рублями — картой или СБП через Tribute, официального партнёра "
-                "Telegram. При первой оплате Telegram спросит разрешение на вход — нажми «Войти». "
+TRIBUTE_HINT = ("\n\n💳 <b>Нет звёзд?</b> Плати рублями по СБП прямо в Telegram — через Tribute, официального "
+                "партнёра Telegram. Если Telegram спросит разрешение на вход — нажми «Войти». "
                 "Звёзды упадут в мешочек сами, сразу после оплаты.")
 
 
@@ -1407,7 +1407,7 @@ def add_tribute_buttons(markup):
         return
     for product_id, stars in sorted(TRIBUTE.products.items(), key=lambda kv: kv[1]):
         price = TRIBUTE.price_label(product_id)
-        label = f"💳 {stars}⭐ за {price} — картой / СБП" if price else f"💳 {stars}⭐ — картой / СБП"
+        label = f"💳 {stars}⭐ за ~{price} — по СБП" if price else f"💳 {stars}⭐ — по СБП"
         markup.add(types.InlineKeyboardButton(label, url=TRIBUTE.link(product_id)))
 
 

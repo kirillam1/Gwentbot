@@ -19,11 +19,16 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
+import os
+
 import requests
 
 logger = logging.getLogger("lavk_bot")
 
 API_BASE = "https://tribute.tg/api/v1"
+# Внутри Telegram Tribute продаёт только за звёзды: «в рублях через СБП» — это покупка звёзд по курсу Telegram.
+# Итог для покупателя ≈ цена товара × эта наценка (замер ноября 2026: 275 ₽ → 360 ₽, 519 ₽ → 680 ₽).
+SBP_MARKUP = float(os.getenv("TRIBUTE_SBP_MARKUP", "1.31"))
 WEBHOOK_PATH = "/tribute/webhook"
 
 
@@ -94,9 +99,8 @@ class Tribute:
                 data = r.json()
                 data = data.get("data", data) if isinstance(data, dict) else data
                 amount, currency = int(data["amount"]), str(data.get("currency", "RUB")).upper()
-                value = amount / 100
-                text = f"{value:.0f}" if value.is_integer() else f"{value:.2f}"
-                prices[product_id] = f"{text} {'₽' if currency == 'RUB' else currency}"
+                value = round(amount / 100 * SBP_MARKUP)
+                prices[product_id] = f"{value} {'₽' if currency == 'RUB' else currency}"
                 if isinstance(data.get("link"), str) and data["link"].startswith("https://"):
                     links[product_id] = data["link"]
             except Exception as e:
