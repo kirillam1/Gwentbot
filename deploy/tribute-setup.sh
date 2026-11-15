@@ -38,11 +38,48 @@ while [ -z "$KEY" ]; do
 done
 
 say "Шаг 2 из 5. Товары"
-echo "   Для каждого товара: вставь ссылку (кнопка «Ссылка» в карточке товара), потом сколько звёзд он даёт."
-echo "   Когда товары закончатся — просто нажми Enter на пустой ссылке."
+code="$(curl -s -o /tmp/tribute_products.json -w '%{http_code}' -H "Api-Key: $KEY" "https://tribute.tg/api/v1/products?size=100&type=digital" || true)"
+if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+  fail "Tribute не принял ключ API (код $code). Проверь ключ и запусти скрипт заново."
+fi
 PRODUCTS=""
+if [ "$code" = "200" ]; then
+  # Берём товары из Tribute сами: число в начале названия («100 звёзд…») — сколько звёзд он даёт.
+  PRODUCTS="$(python3 - /tmp/tribute_products.json <<'PY'
+import json, re, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+def find_items(x):
+    if isinstance(x, list) and x and isinstance(x[0], dict) and "id" in x[0]:
+        return x
+    if isinstance(x, dict):
+        for v in x.values():
+            r = find_items(v)
+            if r: return r
+    return []
+pairs = []
+for p in find_items(data):
+    m = re.match(r"\s*(\d+)\s*(зв|⭐|star)", str(p.get("name", "")), re.I)
+    if m and str(p.get("status", "approved")) != "rejected":
+        pairs.append((int(m.group(1)), int(p["id"]), p.get("name"), p.get("amount"), p.get("currency")))
+for stars, pid, name, amount, cur in sorted(pairs):
+    price = f"{int(amount)/100:.0f} {cur}" if isinstance(amount, (int, float)) else "?"
+    print(f"   • {name} — {price} → {stars}⭐ (товар {pid})", file=sys.stderr)
+print(",".join(f"{pid}:{stars}" for stars, pid, *_ in sorted(pairs)))
+PY
+)"
+fi
+if [ -n "$PRODUCTS" ]; then
+  echo "   Нашёл товары выше. Всё верно?"
+  read -r -p "   Enter — да, всё верно; n — ввести вручную: " yn < /dev/tty
+  if [ "$yn" = "n" ] || [ "$yn" = "N" ]; then PRODUCTS=""; fi
+else
+  echo "   Не смог получить список товаров автоматически (код $code) — введём вручную."
+fi
+if [ -z "$PRODUCTS" ]; then
+echo "   Для каждого товара: вставь ссылку или номер товара, потом сколько звёзд он даёт."
+echo "   Когда товары закончатся — просто нажми Enter на пустой ссылке."
 while true; do
-  read -r -p "   Ссылка на товар (или Enter, чтобы закончить): " LINK < /dev/tty
+  read -r -p "   Ссылка или номер товара (или Enter, чтобы закончить): " LINK < /dev/tty
   LINK="$(echo "$LINK" | tr -d '[:space:]')"
   if [ -z "$LINK" ]; then
     [ -n "$PRODUCTS" ] && break
@@ -50,15 +87,7 @@ while true; do
   fi
   ID="$(echo "$LINK" | grep -oE 'p[0-9]+' | head -1 | tr -d p || true)"
   [ -n "$ID" ] || ID="$(echo "$LINK" | grep -oE '[0-9]{3,}' | head -1 || true)"
-  [ -n "$ID" ] || { echo "   Не нашёл номер товара в ссылке. Нужна ссылка вида t.me/tribute/app?startapp=p123456"; continue; }
-  code="$(curl -s -o /tmp/tribute_product.json -w '%{http_code}' -H "Api-Key: $KEY" "https://tribute.tg/api/v1/products/$ID" || true)"
-  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
-    fail "Tribute не принял ключ API (код $code). Проверь ключ и запусти скрипт заново."
-  elif [ "$code" = "200" ]; then
-    echo "   Товар $ID найден: $(head -c 300 /tmp/tribute_product.json)"
-  else
-    echo "   ⚠️ Tribute ответил кодом $code для товара $ID — проверь ссылку. Всё равно добавляю."
-  fi
+  [ -n "$ID" ] || { echo "   Не нашёл номер товара."; continue; }
   STARS=""
   while ! [[ "$STARS" =~ ^[0-9]+$ ]]; do
     read -r -p "   Сколько звёзд даёт товар $ID? " STARS < /dev/tty
@@ -67,6 +96,8 @@ while true; do
   PRODUCTS="${PRODUCTS:+$PRODUCTS,}$ID:$STARS"
   echo "   Добавлен: товар $ID → $STARS⭐"
 done
+fi
+echo "   Товары: $PRODUCTS"
 
 say "Шаг 3 из 5. Обновляю код бота"
 curl -fsSL "$INSTALL_URL" | bash
