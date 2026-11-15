@@ -3296,7 +3296,7 @@ def send_anim_invoice(chat_id: int, card_id: int):
         bot.send_invoice(
             chat_id,
             title="Живая картища",
-            description="Лавк оживит твою картищу: зацикленная анимация со звуком прямо в рамке карты, MP4 и GIF.",
+            description="Анимированная карта уровня CD PROJEKT RED.",
             invoice_payload=f"anim:{chat_id}:{card_id}:{ANIM_PRICE}",
             provider_token="",
             currency="XTR",
@@ -3360,10 +3360,8 @@ def cb_anim(call):
                    types.InlineKeyboardButton("❌ Не надо", callback_data=f"animno:{card['id']}"))
         bot.send_message(
             chat_id,
-            f"🎬 <b>Живая картища</b>\n\nЛавк оживит «{esc(strip_markup(card['data'].get('name', '')))}»: "
-            "арт оживает прямо в рамке, рядом способность и цитата, как в игре. Анимация со звуком и "
-            "зациклена — крутится бесконечно без шва. Движение и звуки — в духе фракции.\n"
-            "Пришлю в двух форматах: <b>MP4</b> со звуком и <b>GIF</b> файлом.\n\n"
+            f"🎬 <b>Живая картища</b>\n\nЛавк оживит «{esc(strip_markup(card['data'].get('name', '')))}» — "
+            "анимированная карта уровня CD PROJEKT RED.\n\n"
             f"Стоимость: {price}",
             reply_markup=markup,
         )
