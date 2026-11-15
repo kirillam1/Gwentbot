@@ -3079,7 +3079,7 @@ FACTION_ANIMATION = {
         "through the air, the polished black plate armor catches flickering firelight",
         "distant war drums, crackling campfires, the clink of armor and a low imperial horn far away"),
     "Чудовища": (
-        "thick green fog crawls and swirls, twisted trees creak and sway, faint glowing eyes blink in the mist, "
+        "thick green fog crawls and swirls, twisted trees creak and sway, eyes watch from the mist, "
         "the toxic swamp water slowly bubbles",
         "eerie swamp ambience, a low monstrous growl, bubbling water, distant howling and buzzing insects"),
     "Скеллиге": (
@@ -3095,8 +3095,8 @@ FACTION_ANIMATION = {
         "a gold coin glints, shadows shift in the alley",
         "rain on cobblestones, a creaking lantern, coins clinking, muffled city sounds of Novigrad at night"),
     "Скоя'таэли": (
-        "sunbeams shift through the canopy, golden leaves and glowing pollen drift down, moss and ferns sway, "
-        "magical flora glows softly",
+        "sunbeams shift through the canopy, golden leaves drift down, dust floats in the light shafts, "
+        "moss and ferns sway in the breeze",
         "a peaceful ancient forest, birdsong, rustling leaves, a gentle breeze and a soft elven flute"),
     "Нейтральная": (
         "candle and fire light flickers across the face and leather armor, smoke and dust drift in warm light, "
@@ -3117,34 +3117,56 @@ ANIM_NEGATIVE = ("text, letters, subtitles, watermark, logo, scene cut, camera s
                  "photorealistic, low quality")
 
 
-def animation_prompt(data: dict, art: bytes) -> str:
+# Магия в анимации — только если её подразумевает категория или она уже видна на арте.
+MAGIC_WORDS = ("маг", "чарод", "колдун", "ведьм", "волшеб", "жрец", "жриц", "друид", "мистик", "некромант",
+               "чернокниж", "заклин", "шаман", "провид", "пророч", "дух", "призрак", "демон", "элементал", "ведун")
+NO_MAGIC_PROMPT = (" Strictly no magic or supernatural effects: no glowing, no sparks, no energy, "
+                   "no floating particles of light, no aura — only natural physical movement and light.")
+NO_MAGIC_NEGATIVE = ", magic effects, glowing particles, sparkles, energy aura, glowing runes, light beams, glowing eyes"
+
+
+def category_is_magic(data: dict) -> bool:
+    text = f"{data.get('category', '')} {data.get('name', '')}".lower()
+    return any(word in text for word in MAGIC_WORDS)
+
+
+def animation_prompt(data: dict, art: bytes) -> tuple[str, str]:
+    """(промпт, негативный промпт) для видео."""
     environment, sound = FACTION_ANIMATION.get(data.get("faction"), FACTION_ANIMATION["Нейтральная"])
-    subject = ""
-    # Gemini смотрит на сам арт и подсказывает, что именно в нём может двигаться (оружие, плащ, магия…).
+    subject, magic = "", category_is_magic(data)
+    # Gemini смотрит на сам арт: что в нём может двигаться (оружие, плащ, волосы) и есть ли там магия.
     answer = ask_gemini_vision(
         as_jpeg(art),
         "You direct a 6-second subtle animation of this fantasy card art. Reply with JSON "
-        '{"subject": "..."} — one English sentence (max 30 words) describing natural, subtle movements of the '
-        "character and the objects they hold or wear that fit this exact image (e.g. glowing magic pulsing, "
-        "a cloak swaying, fingers tightening on a sword hilt). Do not describe the background. "
-        "Do not change the pose or the face.",
+        '{"subject": "...", "magic": false}. '
+        "subject — one English sentence (max 30 words) describing natural, subtle physical movements of the "
+        "character and the objects they hold or wear in this exact image (e.g. a cloak swaying, fingers "
+        "tightening on a sword hilt, a candle flame flickering). Do not describe the background. "
+        "Do not change the pose or the face. "
+        "magic — true ONLY if the image already clearly shows spellcasting, glowing runes or magical energy; "
+        "otherwise false. If magic is false, describe no glow, sparks or energy at all.",
         as_json=True,
     ) if GEMINI_API_KEY else None
-    if isinstance(answer, dict) and isinstance(answer.get("subject"), str):
-        subject = answer["subject"].strip()[:300]
-        if subject and not subject.endswith("."):
-            subject += "."
-    return ANIM_BASE_PROMPT.format(subject=subject, environment=environment, sound=sound)
+    if isinstance(answer, dict):
+        if isinstance(answer.get("subject"), str):
+            subject = answer["subject"].strip()[:300]
+            if subject and not subject.endswith("."):
+                subject += "."
+        magic = magic or answer.get("magic") is True
+    prompt = ANIM_BASE_PROMPT.format(subject=subject, environment=environment, sound=sound)
+    if not magic:
+        return prompt + NO_MAGIC_PROMPT, ANIM_NEGATIVE + NO_MAGIC_NEGATIVE
+    return prompt, ANIM_NEGATIVE
 
 
 def video_path(card_id: int) -> str:
     return os.path.join(VIDEO_DIR, f"{card_id}.mp4")
 
 
-def generate_video(source_jpeg: bytes, prompt: str) -> bytes:
+def generate_video(source_jpeg: bytes, prompt: str, negative: str = ANIM_NEGATIVE) -> bytes:
     image_url = fal_upload(source_jpeg, name="anim_source.jpg") or to_data_uri(source_jpeg, "image/jpeg")
     payload = {
-        "prompt": prompt, "negative_prompt": ANIM_NEGATIVE, "image_url": image_url,
+        "prompt": prompt, "negative_prompt": negative, "image_url": image_url,
         "aspect_ratio": "9:16", "duration": VIDEO_DURATION, "resolution": VIDEO_RESOLUTION,
         "generate_audio": True, "auto_fix": True, "safety_tolerance": FAL_SAFETY,
     }
@@ -3166,10 +3188,26 @@ def generate_video(source_jpeg: bytes, prompt: str) -> bytes:
     return response.content
 
 
-def send_card_video(chat_id: int, video, caption: str, reply_markup=None):
-    width, height = card_video.video_size()
+def gif_path(card_id: int) -> str:
+    return os.path.join(VIDEO_DIR, f"{card_id}.gif")
+
+
+def send_card_video(chat_id: int, video, caption: str, reply_markup=None, size: Optional[tuple] = None):
+    extra = {"width": size[0], "height": size[1]} if size else {}
     return tg_retry(bot.send_video, chat_id, video, caption=caption, reply_markup=reply_markup,
-                    width=width, height=height, supports_streaming=True, timeout=MEDIA_TIMEOUT)
+                    supports_streaming=True, timeout=MEDIA_TIMEOUT, **extra)
+
+
+def send_card_gif(chat_id: int, gif, name: str):
+    """GIF файлом: иначе Telegram сам превратит его в MP4-«гифку», и скачать настоящий GIF будет нельзя."""
+    return tg_retry(bot.send_document, chat_id, gif, visible_file_name=f"{name}.gif",
+                    caption="🎞 То же в GIF — для форумов, Discord и аватарок (без звука).",
+                    disable_content_type_detection=True, timeout=MEDIA_TIMEOUT)
+
+
+def gif_file_name(data: dict) -> str:
+    name = re.sub(r"[^\w\- ]+", "", strip_markup(data.get("name", "")), flags=re.UNICODE).strip().replace(" ", "_")
+    return f"lavk_{name[:40] or 'card'}"
 
 
 def animate_card(chat_id: int, card_id: int, mode: str):
@@ -3179,18 +3217,26 @@ def animate_card(chat_id: int, card_id: int, mode: str):
             raise FalError("исходник картищи уже стёрт")
         art = load_art(card)
         source, window = card_video.video_source_image(art)
-        prompt = animation_prompt(card["data"], art)
-        logger.info("Анимация картищи %s для %s: %s", card_id, chat_id, prompt[:300])
+        prompt, negative = animation_prompt(card["data"], art)
+        logger.info("Анимация картищи %s для %s: %s", card_id, chat_id, prompt[:400])
         started = time.monotonic()
-        raw = generate_video(source, prompt)
+        raw = generate_video(source, prompt, negative)
         logger.info("Видео для картищи %s нарисовано за %.0f с", card_id, time.monotonic() - started)
         with RENDER_LOCK:
-            overlay = card_video.card_overlay(card["data"])
-        mp4 = card_video.compose_card_video(raw, overlay, window)
+            overlay, window_pos = card_video.card_overlay(card["data"])
+        mp4 = card_video.compose_card_video(raw, overlay, window_pos, window)
+        try:
+            gif = card_video.make_gif(mp4)
+        except Exception:
+            logger.exception("Не удалось собрать GIF картищи %s", card_id)
+            gif = None
         try:
             os.makedirs(VIDEO_DIR, exist_ok=True)
             with open(video_path(card_id), "wb") as f:
                 f.write(mp4)
+            if gif:
+                with open(gif_path(card_id), "wb") as f:
+                    f.write(gif)
         except OSError:
             logger.exception("Не удалось сохранить видео картищи %s", card_id)
 
@@ -3200,17 +3246,23 @@ def animate_card(chat_id: int, card_id: int, mode: str):
         file_id = ""
         try:
             try:
-                msg = send_card_video(chat_id, source_url or mp4, caption)
+                msg = send_card_video(chat_id, source_url or mp4, caption, size=overlay.size)
             except apihelper.ApiTelegramException as e:
                 if not source_url or not is_url_fetch_error(e):
                     raise
-                msg = send_card_video(chat_id, mp4, caption)
+                msg = send_card_video(chat_id, mp4, caption, size=overlay.size)
             file_id = msg.video.file_id
         except (requests.ReadTimeout, requests.ConnectionError) as e:
             # Как с картищами: видео почти наверняка дошло, повтор дал бы дубль.
             logger.warning("Telegram не подтвердил доставку видео для %s: %s", chat_id, e.__class__.__name__)
         safe_call(bot.delete_message, chat_id, status.message_id)
         data = dict(card["data"], video_file_id=file_id)
+        if gif:
+            # Видео уже у человека — сбой GIF не должен вести к возврату звёзд.
+            try:
+                data["gif_file_id"] = send_card_gif(chat_id, gif, gif_file_name(card["data"])).document.file_id
+            except Exception:
+                logger.exception("Не удалось отправить GIF картищи %s", card_id)
         db.update_card_data(card_id, data)
         try:
             if not file_id:
@@ -3281,7 +3333,11 @@ def cb_anim(call):
             return
         safe_call(bot.answer_callback_query, call.id)
         send_card_video(chat_id, card["data"]["video_file_id"],
-                        f"🎬 «{esc(strip_markup(card['data'].get('name', '')))}»", reply_markup=card_markup(card))
+                        f"🎬 «{esc(strip_markup(card['data'].get('name', '')))}»",
+                        reply_markup=None if card["data"].get("gif_file_id") else card_markup(card))
+        if card["data"].get("gif_file_id"):
+            send_card_gif(chat_id, card["data"]["gif_file_id"], gif_file_name(card["data"]))
+            bot.send_message(chat_id, "🃏 Что дальше с картищей?", reply_markup=card_markup(card))
         return
 
     reason = anim_blocker(chat_id, card)
@@ -3297,8 +3353,9 @@ def cb_anim(call):
         bot.send_message(
             chat_id,
             f"🎬 <b>Живая картища</b>\n\nЛавк оживит «{esc(strip_markup(card['data'].get('name', '')))}»: "
-            f"{VIDEO_DURATION[:-1]} секунд анимации со звуком, прямо в рамке карты. "
-            "Движение и звуки — в духе фракции.\n\n"
+            f"{VIDEO_DURATION[:-1]} секунд анимации со звуком — арт оживает прямо в рамке, рядом способность "
+            "и цитата, как в игре. Движение и звуки — в духе фракции.\n"
+            "Пришлю в двух форматах: <b>MP4</b> со звуком и <b>GIF</b> файлом.\n\n"
             f"Стоимость: {price}",
             reply_markup=markup,
         )

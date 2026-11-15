@@ -4,9 +4,9 @@
 1. video_source_image — из чистого арта собирается кадр 9:16 для видеомодели (Veo принимает только
    16:9 и 9:16). Видимая в рамке часть арта стоит по центру, сверху и снизу — продолжение арта
    (или размытый фон, если арта не хватает). Эти поля потом отрезаются.
-2. card_overlay — карта в рамке, где окно арта прозрачное: рамка, ромб силы, броня, провизия.
+2. card_overlay — полная карта (рамка + панель со способностью и цитатой), где окно арта прозрачное.
 3. compose_card_video — ffmpeg вырезает из ролика видимую часть, вписывает её в окно
-   и кладёт рамку сверху. Звук ролика сохраняется.
+   и кладёт карту сверху. Звук ролика сохраняется. make_gif — та же анимация в GIF (без звука).
 """
 import io
 import os
@@ -19,12 +19,11 @@ from PIL import Image, ImageFilter
 
 import card_render as cr
 
-# Окно арта внутри картинки «карта в рамке» (CARD_ONLY_BOX) — как в card_render.draw_card.
+# Окно арта на холсте карты — как в card_render.draw_card.
 WINDOW_W, WINDOW_H = round(990 * cr.CARD_SCALE[0]), round(1422 * cr.CARD_SCALE[1])
-WINDOW_X, WINDOW_Y = cr.CARD_POS[0] - cr.CARD_ONLY_BOX[0], cr.CARD_POS[1] - cr.CARD_ONLY_BOX[1]
 FIT_CENTERING = (0.5, 0.4)          # то же, что ImageOps.fit в draw_card
 SOURCE_SIZE = (1080, 1920)          # кадр для Veo, 9:16
-OUT_SCALE = 2                       # итоговое видео вдвое крупнее картинки-карты: на телефоне выглядит чётко
+GIF_WIDTH, GIF_FPS = 800, 12        # GIF заметно тяжелее MP4: уменьшаем и реже кадры
 
 
 def ffmpeg_available() -> bool:
@@ -62,39 +61,49 @@ def video_source_image(art_bytes: bytes) -> tuple[bytes, tuple[float, float, flo
     return out.getvalue(), (0.0, top / sh, 1.0, win_h / sh)
 
 
-def card_overlay(data: dict) -> Image.Image:
-    """Карта в рамке, где окно арта прозрачное.
+def card_overlay(data: dict) -> tuple[Image.Image, tuple[int, int]]:
+    """Полная карта (как картинка карты: рамка + панель со способностью и цитатой) с прозрачным окном арта.
+    Возвращает слой и левый верхний угол окна арта в нём.
 
     Карта собирается дважды — на чёрном и на белом арте. Где пиксели совпали, там рамка или
-    значки (непрозрачно); где разошлись — сквозь них видно арт. Так прозрачность получается
+    текст (непрозрачно); где разошлись — сквозь них видно арт. Так прозрачность получается
     точной и на сглаженных краях рамки, без ручной разметки окна.
     """
     def render(color):
         art = Image.new("RGB", (WINDOW_W, WINDOW_H), color)
         canvas = cr.asset("background.jpg").copy()
+        bottom = cr.draw_panel(canvas, data)
         cr.draw_card(canvas, art, data)
-        return np.asarray(canvas.crop(cr.CARD_ONLY_BOX).convert("RGB"), dtype=np.float32)
+        crop_bottom = min(canvas.height, max(cr.CARD_BOTTOM, bottom) + cr.CROP_MARGIN)
+        if (crop_bottom - cr.CROP_TOP) % 2:      # H.264 требует чётные стороны
+            crop_bottom += 1 if crop_bottom < canvas.height else -1
+        box = (cr.CROP_X[0], cr.CROP_TOP, cr.CROP_X[1], crop_bottom)
+        return np.asarray(canvas.crop(box).convert("RGB"), dtype=np.float32), box
 
-    black, white = render((0, 0, 0)), render((255, 255, 255))
+    (black, box), (white, _) = render((0, 0, 0)), render((255, 255, 255))
     alpha = 1.0 - (white - black).max(axis=2, keepdims=True) / 255.0
     alpha = np.clip(alpha, 0.0, 1.0)
     color = np.where(alpha > 1e-3, black / np.maximum(alpha, 1e-3), 0.0)
     rgba = np.concatenate([np.clip(color, 0, 255), alpha * 255.0], axis=2)
-    return Image.fromarray(rgba.round().astype(np.uint8), "RGBA")
+    window = (cr.CARD_POS[0] - box[0], cr.CARD_POS[1] - box[1])
+    return Image.fromarray(rgba.round().astype(np.uint8), "RGBA"), window
 
 
-def compose_card_video(raw_video: bytes, overlay: Image.Image, window: tuple[float, float, float, float],
-                       timeout: int = 180) -> bytes:
-    """Готовое MP4: ролик в окне карты, рамка поверх, звук как в исходнике."""
+def compose_card_video(raw_video: bytes, overlay: Image.Image, window_pos: tuple[int, int],
+                       window: tuple[float, float, float, float], timeout: int = 180) -> bytes:
+    """Готовое MP4: ролик в окне арта, карта с панелью поверх, звук как в исходнике.
+
+    window_pos — где окно арта в слое карты; window — где окно в кадре ролика (доли).
+    """
     fx, fy, fw, fh = window
-    k = OUT_SCALE
-    out_w, out_h = overlay.width * k, overlay.height * k
-    win_w, win_h, win_x, win_y = WINDOW_W * k, WINDOW_H * k, WINDOW_X * k, WINDOW_Y * k
+    out_w, out_h = overlay.size
+    win_w, win_h = WINDOW_W, WINDOW_H
+    win_x, win_y = window_pos
     with tempfile.TemporaryDirectory() as tmp:
         src, frame, dst = (os.path.join(tmp, n) for n in ("src.mp4", "frame.png", "card.mp4"))
         with open(src, "wb") as f:
             f.write(raw_video)
-        overlay.resize((out_w, out_h), Image.LANCZOS).save(frame)
+        overlay.save(frame)
         graph = (
             f"[0:v]crop=iw*{fw:.6f}:ih*{fh:.6f}:iw*{fx:.6f}:ih*{fy:.6f},"
             f"scale={win_w}:{win_h}:flags=lanczos,setsar=1[art];"
@@ -115,6 +124,18 @@ def compose_card_video(raw_video: bytes, overlay: Image.Image, window: tuple[flo
             return f.read()
 
 
-def video_size() -> tuple[int, int]:
-    w, h = cr.CARD_ONLY_BOX[2] - cr.CARD_ONLY_BOX[0], cr.CARD_ONLY_BOX[3] - cr.CARD_ONLY_BOX[1]
-    return w * OUT_SCALE, h * OUT_SCALE
+def make_gif(mp4: bytes, timeout: int = 180) -> bytes:
+    """GIF из готового видео: своя палитра на весь ролик, чтобы цвета арта не «полосили»."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "card.mp4"), os.path.join(tmp, "card.gif")
+        with open(src, "wb") as f:
+            f.write(mp4)
+        graph = (f"fps={GIF_FPS},scale={GIF_WIDTH}:-2:flags=lanczos,split[a][b];"
+                 "[a]palettegen=max_colors=256:stats_mode=diff[p];"
+                 "[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle")
+        result = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", graph,
+                                 "-loop", "0", dst], capture_output=True, timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg gif: {result.stderr.decode(errors='replace')[-800:]}")
+        with open(dst, "rb") as f:
+            return f.read()
