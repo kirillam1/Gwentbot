@@ -2388,8 +2388,33 @@ def tg_retry(func, *args, attempts: int = 3, idempotent: bool = False, **kwargs)
         time.sleep(delay)
 
 
+class PhotoFetchError(Exception):
+    """Telegram так и не отдал файл пользователя."""
+
+
 def download_telegram_file(file_id: str) -> bytes:
-    return tg_retry(lambda: bot.download_file(bot.get_file(file_id).file_path), idempotent=True)
+    """Скачивает файл пользователя из Telegram.
+
+    getFile у Telegram (с октября 2026) иногда «залипает» на соединении: ответа нет минутами,
+    а повтор с новым соединением проходит за доли секунды. Поэтому короткий таймаут,
+    новое соединение на каждую попытку и до 4 попыток. Токен в URL — в логи пишем только тип ошибки.
+    """
+    last = None
+    for attempt in range(1, 5):
+        try:
+            with requests.Session() as s:
+                r = s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+                           data={"file_id": file_id}, timeout=(10, 20))
+                r.raise_for_status()
+                path = r.json()["result"]["file_path"]
+                f = s.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}", timeout=(10, 60))
+                f.raise_for_status()
+                return f.content
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last = e
+            logger.warning("Фото из Telegram: попытка %s не удалась (%s)", attempt, e.__class__.__name__)
+            time.sleep(2 * attempt)
+    raise PhotoFetchError(f"Telegram не отдал файл после 4 попыток ({last.__class__.__name__})")
 
 
 def refund(chat_id: int, price: int, mode: str) -> str:
@@ -2632,6 +2657,9 @@ def run_art_job(chat_id: int, price: int, mode: str, job: Callable[[object], Non
         stop.set()
         if isinstance(e, FalError):
             text = f"⚠️ Духи не смогли нарисовать: {esc(e)}"
+        elif isinstance(e, PhotoFetchError):
+            logger.warning("Ошибка генерации для %s: %s", chat_id, e)
+            text = "⚠️ Telegram не отдал Лавку твоё фото — так бывает при сбоях Telegram."
         else:
             # Текст исключения пользователю не показываем: в URL Telegram-файлов содержится токен бота.
             logger.exception("Ошибка генерации для %s", chat_id)
