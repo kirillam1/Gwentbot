@@ -1397,8 +1397,7 @@ TRIBUTE = tribute.Tribute(os.getenv("TRIBUTE_API_KEY", "").strip(),
                           tribute_purchase, tribute_refund)
 TRIBUTE_PORT = int(os.getenv("TRIBUTE_PORT", "8090"))
 TRIBUTE_HINT = ("\n\n💳 <b>Нет звёзд?</b> Плати рублями по СБП прямо в Telegram — через Tribute, официального "
-                "партнёра Telegram. Если Telegram спросит разрешение на вход — нажми «Войти». "
-                "Звёзды упадут в мешочек сами, сразу после оплаты.")
+                "партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.")
 
 
 def add_tribute_buttons(markup):

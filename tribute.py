@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import logging
 import re
 import threading
@@ -27,8 +28,15 @@ logger = logging.getLogger("lavk_bot")
 
 API_BASE = "https://tribute.tg/api/v1"
 # Внутри Telegram Tribute продаёт только за звёзды: «в рублях через СБП» — это покупка звёзд по курсу Telegram.
-# Итог для покупателя ≈ цена товара × эта наценка (замер ноября 2026: 275 ₽ → 360 ₽, 519 ₽ → 680 ₽).
-SBP_MARKUP = float(os.getenv("TRIBUTE_SBP_MARKUP", "1.31"))
+# Замер ноября 2026: товар 275 ₽ → 249⭐ → 360 ₽ по СБП; 519 ₽ → 470⭐ → 680 ₽; 145 ₽ → 132⭐.
+RUB_PER_STAR = float(os.getenv("TRIBUTE_RUB_PER_STAR", "1.105"))   # цена товара → звёзды (вверх)
+SBP_PER_STAR = float(os.getenv("TRIBUTE_SBP_PER_STAR", "1.446"))    # звезда при покупке по СБП
+
+
+def sbp_price(amount_rub: float, stars: int = 0) -> int:
+    """Сколько покупатель заплатит по СБП внутри Telegram за товар с такой ценой."""
+    stars = stars or math.ceil(amount_rub / RUB_PER_STAR - 1e-9)
+    return round(stars * SBP_PER_STAR)
 WEBHOOK_PATH = "/tribute/webhook"
 
 
@@ -99,7 +107,8 @@ class Tribute:
                 data = r.json()
                 data = data.get("data", data) if isinstance(data, dict) else data
                 amount, currency = int(data["amount"]), str(data.get("currency", "RUB")).upper()
-                value = round(amount / 100 * SBP_MARKUP)
+                stars = data.get("starsAmount") if data.get("starsAmountEnabled") else 0
+                value = sbp_price(amount / 100, int(stars or 0))
                 prices[product_id] = f"{value} {'₽' if currency == 'RUB' else currency}"
                 if isinstance(data.get("link"), str) and data["link"].startswith("https://"):
                     links[product_id] = data["link"]
