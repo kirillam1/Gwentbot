@@ -948,13 +948,67 @@ def _retry_delay(e: Exception) -> float:
     return float(m.group(1)) if m else 60.0
 
 
+# Платный «мозг» через fal (OpenRouter на балансе fal): когда у основной Gemini кончился бесплатный лимит,
+# бот берёт ту же по уровню модель за копейки с баланса fal, а не слабую lite. FAL_LLM_MODEL=off — выключить.
+FAL_LLM_MODEL = os.getenv("FAL_LLM_MODEL", "google/gemini-2.5-flash").strip()
+
+
+def fal_llm(contents, config) -> Optional[str]:
+    if not FAL_KEY or FAL_LLM_MODEL.lower() in ("", "off", "none"):
+        return None
+    with _gemini_lock:
+        if time.time() < _gemini_blocked.get("fal_llm", 0):
+            return None
+    texts, images = [], []
+    for part in (contents if isinstance(contents, list) else [contents]):
+        if isinstance(part, str):
+            texts.append(part)
+        elif getattr(part, "inline_data", None) is not None:
+            data, mime = part.inline_data.data, part.inline_data.mime_type or "image/jpeg"
+            images.append(fal_upload(data, mime, "llm.jpg") or to_data_uri(data, mime))
+        elif getattr(part, "text", None):
+            texts.append(part.text)
+    prompt = "\n\n".join(texts)
+    if getattr(config, "response_mime_type", None) == "application/json":
+        prompt += "\n\nReply with valid JSON only — no markdown, no comments."
+    payload = {"prompt": prompt, "model": FAL_LLM_MODEL}
+    temperature = getattr(config, "temperature", None)
+    if temperature is not None:
+        payload["temperature"] = min(float(temperature), 1.5)
+    endpoint = "openrouter/router/vision" if images else "openrouter/router"
+    if images:
+        payload["image_urls"] = images
+    try:
+        r = requests.post(f"https://fal.run/{endpoint}", json=payload, timeout=(10, 90),
+                          headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"})
+        if r.status_code in (402, 403):
+            with _gemini_lock:
+                _gemini_blocked["fal_llm"] = time.time() + 1800
+            logger.warning("Gemini через fal: отказ %s (баланс или права), отключаю на 30 минут", r.status_code)
+            return None
+        r.raise_for_status()
+        text = (r.json().get("output") or "").strip()
+        if text:
+            logger.info("Ответил %s через fal", FAL_LLM_MODEL)
+            return text
+    except Exception as e:
+        logger.warning("Gemini через fal не ответил: %s", str(e)[:200])
+    return None
+
+
 def gemini_generate(contents, config) -> Optional[str]:
     """Один ответ Gemini: перебирает модели, пропуская те, у которых исчерпан лимит.
 
     Модель с исчерпанной квотой отключается до сброса лимита — бот не тратит время
     на заведомо неудачные запросы. None — ни одна модель сейчас не доступна.
     """
-    for model in (GEMINI_MODELS if gemini_client is not None else []):
+    for i, model in enumerate(GEMINI_MODELS if gemini_client is not None else []):
+        if i == 1:
+            # Основная модель не ответила (обычно — кончился бесплатный лимит): сначала платная через fal,
+            # и только потом облегчённые бесплатные — они заметно хуже придумывают образы.
+            text = fal_llm(contents, config)
+            if text:
+                return text
         with _gemini_lock:
             if time.time() < _gemini_blocked.get(model, 0):
                 continue
