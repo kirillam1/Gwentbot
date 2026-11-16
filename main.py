@@ -1536,6 +1536,81 @@ def cb_rub_pack(call):
     bot.send_message(chat_id, "Открой товар и оплати — звёзды упадут в мешочек сами.", reply_markup=markup)
 
 
+# ---------- пример живой картищи после пробной ----------
+# Админ один раз назначает видео: отвечает на сообщение с живой картищей словом «пример»
+# (или присылает видео с подписью «пример»). Бот хранит только file_id — повторно ничего не загружается.
+EXAMPLE_FILE = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "example_video.json")
+
+
+def example_video() -> Optional[dict]:
+    try:
+        with open(EXAMPLE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if data.get("file_id") else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def set_example_video(file_id: Optional[str], kind: str = "video"):
+    if not file_id:
+        try:
+            os.remove(EXAMPLE_FILE)
+        except OSError:
+            pass
+        return
+    tmp = EXAMPLE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"file_id": file_id, "kind": kind}, f)
+    os.replace(tmp, EXAMPLE_FILE)
+
+
+def media_of(message) -> Optional[tuple]:
+    if message is None:
+        return None
+    if getattr(message, "video", None):
+        return message.video.file_id, "video"
+    if getattr(message, "animation", None):
+        return message.animation.file_id, "animation"
+    return None
+
+
+def is_example_command(message) -> bool:
+    if not is_admin(message.from_user.id):
+        return False
+    text = (message.text or message.caption or "").strip().lower()
+    if text in ("пример убрать", "/example_off"):
+        return True
+    if text not in ("пример", "/example"):
+        return False
+    return media_of(message) is not None or media_of(message.reply_to_message) is not None
+
+
+@bot.message_handler(func=is_example_command, content_types=["text", "video", "animation"])
+def cmd_example(message):
+    text = (message.text or message.caption or "").strip().lower()
+    if text in ("пример убрать", "/example_off"):
+        set_example_video(None)
+        bot.reply_to(message, "🗑 Пример живой картищи убран — после пробной больше не показывается.")
+        return
+    file_id, kind = media_of(message) or media_of(message.reply_to_message)
+    set_example_video(file_id, kind)
+    bot.reply_to(message, "✅ Это видео теперь показывается после каждой пробной картищи как пример.\n"
+                          "Убрать: напиши «пример убрать».")
+
+
+def send_example_video(chat_id: int):
+    example = example_video()
+    if not example:
+        return
+    caption = (f"🎬 <b>А вот так Лавк оживляет картищи!</b> Движение и звук.\n"
+               f"Сними водяные знаки со своей — и её тоже можно будет оживить за {ANIM_PRICE}⭐.")
+    send = bot.send_animation if example.get("kind") == "animation" else bot.send_video
+    try:
+        send(chat_id, example["file_id"], caption=caption)
+    except apihelper.ApiTelegramException as e:
+        logger.warning("Не удалось показать пример живой картищи: %s", e)
+
+
 @bot.message_handler(func=lambda msg: is_admin(msg.from_user.id) and tribute_stars_in(msg) is not None,
                      content_types=["text", "photo", "video", "animation", "document"])
 def remember_tribute_product(message):
@@ -2982,6 +3057,8 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                     "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
         # Главное меню — обычной клавиатурой, правка (или пополнение) — кнопкой под отдельным сообщением.
         bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
+        if trial:
+            send_example_video(chat_id)
         action = ("Снять водяные знаки?" if trial
                   else f"Поправить арт или оживить картищу — с движением и звуком?\n"
                        f"<i>Правки и анимация доступны {plural_days(CARD_TTL_DAYS)} — потом исходник стирается.</i>")
