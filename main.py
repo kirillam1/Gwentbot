@@ -675,7 +675,7 @@ def card_markup(card: dict, with_deck: bool = False):
 # ==========================================
 # 2б. КАРТИНКИ ЛАВКА НА КАЖДОМ ЭКРАНЕ
 # ==========================================
-# Рисуются один раз из админки (Fal Kontext по образцу WELCOME_IMAGE) и лежат в постоянном хранилище.
+# Рисуются один раз из админки (Nano Banana 2 по образцу WELCOME_IMAGE) и лежат в постоянном хранилище.
 SCENE_DIR = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "scenes")
 CAPTION_LIMIT = 1000   # у Telegram 1024 символа на подпись к фото, оставляем запас
 SCENES = {
@@ -876,16 +876,21 @@ def draw_scene(key: str) -> None:
     if not os.path.exists(WELCOME_IMAGE):
         raise FalError(f"нет образца {os.path.basename(WELCOME_IMAGE)} рядом с main.py")
     with open(WELCOME_IMAGE, "rb") as f:
-        reference = to_data_uri(f.read(), "image/jpeg")
+        image = f.read()
+    # Nano Banana 2 — та же модель, что рисует картищи: лучше держит персонажа и не ломает руки и предметы.
+    reference = fal_upload(image, "image/jpeg", "lavk.jpg") or to_data_uri(image, "image/jpeg")
     action = SCENES[key][1]
-    art = fal_with_retry(FAL_EDIT_ENDPOINT, lambda: {
-        "prompt": (f"Keep this exact character — the same face, hair, beard, body, clothes and painting style. "
-                   f"Now show him {action}. Cozy candle-lit cave workshop of a painter in the world of The Witcher, "
-                   "hand-painted Gwent card art style, warm light, detailed background."),
-        "image_url": reference,
+    art = fal_with_retry(ART_MODELS["nb2"][2], lambda: {
+        "prompt": ("Keep this exact character from the reference image — the same face, body, skin, proportions "
+                   "and outfit — and the same hand-painted fantasy illustration style, warm candle light and "
+                   f"cluttered workshop setting. Now show him {action}. One character only, correct hands, "
+                   "no text or lettering in the picture."),
+        "image_urls": [reference],
         "aspect_ratio": "4:3",
-        "guidance_scale": 3.5,
+        "resolution": "1K",
+        "num_images": 1,
         "output_format": "jpeg",
+        "safety_tolerance": "4",
     })
     os.makedirs(SCENE_DIR, exist_ok=True)
     tmp = scene_path(key) + ".tmp"
