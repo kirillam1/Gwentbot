@@ -509,7 +509,7 @@ def _guilloche(size, rng, k: float) -> Image.Image:
 
 
 def _seal(size, center, k: float, rng) -> Image.Image:
-    """Крупная печать «ЛАВК · ПРОБНАЯ» прямо по центру арта — там, где лицо."""
+    """Крупная печать «ЛАВК · ПРОБНАЯ» на арте (под лицом, на одежде)."""
     w, h = size
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
@@ -529,7 +529,42 @@ def _seal(size, center, k: float, rng) -> Image.Image:
     return layer.rotate(rng.uniform(-14, 14), center=center, resample=Image.BICUBIC)
 
 
-def watermark(img: Image.Image, tag: str = "", center=None, unit: float | None = None) -> Image.Image:
+# Лицо на пробной картище оставляем чистым: человек должен увидеть себя в образе («вау»), а остальной
+# арт под знаком. Где лицо — знает Gemini (data["face"], доли от арта); без него — типичное место на портрете.
+DEFAULT_FACE = (0.36, 0.20, 0.64, 0.46)
+
+
+def art_face_window(data: dict, art_size: tuple[int, int]) -> tuple[float, float, float, float]:
+    """(cx, cy, rx, ry) окна вокруг лица в координатах холста — с учётом того, как draw_card вписывает арт."""
+    face = data.get("face") or DEFAULT_FACE
+    try:
+        x0, y0, x1, y1 = (float(v) for v in face)
+    except (TypeError, ValueError):
+        x0, y0, x1, y1 = DEFAULT_FACE
+    aw, ah = art_size
+    card_w, card_h = round(990 * CARD_SCALE[0]), round(1422 * CARD_SCALE[1])
+    k = max(card_w / aw, card_h / ah)                     # как ImageOps.fit: масштаб «заполнить»
+    left, top = (aw * k - card_w) * 0.5, (ah * k - card_h) * 0.4
+    px = lambda x: CARD_POS[0] + x * aw * k - left
+    py = lambda y: CARD_POS[1] + y * ah * k - top
+    cx, cy = (px(x0) + px(x1)) / 2, (py(y0) + py(y1)) / 2
+    # С запасом: волосы, уши, подбородок. Но не больше трети ширины карты, чтобы арт не оголялся целиком.
+    rx = min((px(x1) - px(x0)) * 0.75, card_w * 0.33)
+    ry = min((py(y1) - py(y0)) * 0.75, card_h * 0.25)
+    return cx, cy, max(rx, card_w * 0.12), max(ry, card_h * 0.08)
+
+
+def _window_mask(size, window) -> np.ndarray:
+    """1 — знак виден, 0 — чистое окно (эллипс с мягким краем)."""
+    w, h = size
+    cx, cy, rx, ry = window
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    d = np.sqrt(((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2)
+    return np.clip((d - 0.85) / 0.35, 0.0, 1.0)
+
+
+def watermark(img: Image.Image, tag: str = "", center=None, unit: float | None = None,
+              window=None) -> Image.Image:
     """Водяной знак пробной картищи.
 
     Слои: сетка волнистых линий, крупный текст, мелкий текст с ID владельца под другим углом,
@@ -557,6 +592,8 @@ def watermark(img: Image.Image, tag: str = "", center=None, unit: float | None =
     arr = np.asarray(mark).astype(np.float32)
     noise = np.asarray(Image.effect_noise((w, h), 60).filter(ImageFilter.GaussianBlur(1)), dtype=np.float32)
     arr[..., 3] *= 0.75 + 0.5 * (noise / 255.0)
+    if window is not None:
+        arr[..., 3] *= _window_mask((w, h), window)
     mark = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
 
     out = img.convert("RGBA")
@@ -598,11 +635,17 @@ def render_card(art_bytes: bytes, data: dict, trial: bool = False, tag: str = ""
     full = canvas.crop((CROP_X[0], CROP_TOP, CROP_X[1], crop_bottom))
     card_only = canvas.crop(CARD_ONLY_BOX)
     if trial:
-        # Центр арта (под печать) в координатах каждой обрезки.
-        art_cx, art_cy = (CARD_ONLY_BOX[0] + CARD_ONLY_BOX[2]) / 2, CARD_ONLY_BOX[1] + (CARD_ONLY_BOX[3] - CARD_ONLY_BOX[1]) * 0.4
+        # Лицо — чистое окно; печать — ниже лица, на одежде.
+        cx, cy, rx, ry = art_face_window(data, art.size)
+        card_bottom = CARD_ONLY_BOX[3]
         unit = ((CARD_ONLY_BOX[2] - CARD_ONLY_BOX[0]) * (CARD_ONLY_BOX[3] - CARD_ONLY_BOX[1])) ** 0.5
-        full = watermark(full, tag, (art_cx - CROP_X[0], art_cy - CROP_TOP), unit)
-        card_only = watermark(card_only, tag, (art_cx - CARD_ONLY_BOX[0], art_cy - CARD_ONLY_BOX[1]), unit)
+        seal_r = unit * 0.23
+        seal_y = min(cy + ry + seal_r * 1.05, card_bottom - seal_r * 1.1)
+        for_full = (cx - CROP_X[0], cy - CROP_TOP, rx, ry)
+        for_card = (cx - CARD_ONLY_BOX[0], cy - CARD_ONLY_BOX[1], rx, ry)
+        full = watermark(full, tag, (cx - CROP_X[0], seal_y - CROP_TOP), unit, window=for_full)
+        card_only = watermark(card_only, tag, (cx - CARD_ONLY_BOX[0], seal_y - CARD_ONLY_BOX[1]), unit,
+                              window=for_card)
         return (to_jpeg(full, TRIAL_MAX_SIDE, TRIAL_JPEG_QUALITY),
                 to_jpeg(card_only, TRIAL_MAX_SIDE, TRIAL_JPEG_QUALITY))
     return to_jpeg(full), to_jpeg(card_only)

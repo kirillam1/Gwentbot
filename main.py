@@ -661,6 +661,9 @@ def card_markup(card: dict, with_deck: bool = False):
         # Пробную картищу не правим — иначе правка за полцены снимала бы водяные знаки.
         markup.add(types.InlineKeyboardButton(f"🎨 Чистая картища — {GENERATION_PRICE}⭐",
                                               callback_data=f"unlock:{card['id']}"))
+        # Видео выходит без водяных знаков, а чистая картинка — в подарок.
+        markup.add(types.InlineKeyboardButton(f"🎬 Оживить — {ANIM_PRICE}⭐ (чистая картища в подарок)",
+                                              callback_data=f"anim:{card['id']}"))
     else:
         markup.row(types.InlineKeyboardButton(f"✏️ Правка — {EDIT_PRICE}⭐", callback_data=f"edit:{card['id']}"),
                    types.InlineKeyboardButton(f"🎬 Оживить — {ANIM_PRICE}⭐", callback_data=f"anim:{card['id']}"))
@@ -1603,7 +1606,7 @@ def send_example_video(chat_id: int):
     if not example:
         return
     caption = (f"🎬 <b>А вот так Лавк оживляет картищи!</b> Движение и звук.\n"
-               f"Сними водяные знаки со своей — и её тоже можно будет оживить за {ANIM_PRICE}⭐.")
+               f"Оживи свою — кнопка «🎬 Оживить» ниже, {ANIM_PRICE}⭐, и водяные знаки Лавк сотрёт в подарок.")
     send = bot.send_animation if example.get("kind") == "animation" else bot.send_video
     try:
         send(chat_id, example["file_id"], caption=caption)
@@ -2022,9 +2025,7 @@ def pre_checkout(query):
         card = db.get_card(card_id, user_id)
         # «Занят прошлой картищей» оплату не блокирует: звёзды просто лягут в мешочек.
         reason = None
-        if card is not None and card["data"].get("trial"):
-            reason = "Сначала сними водяные знаки — кнопка «Чистая картища»!"
-        elif card is not None and not has_clean_art(card):
+        if card is not None and not has_clean_art(card):
             reason = expired_text()
         if owner != user_id or price != query.total_amount or card is None:
             bot.answer_pre_checkout_query(query.id, ok=False, error_message="Этот счёт устарел. Нажми «Оживить» ещё раз.")
@@ -3014,6 +3015,17 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                  parent_id: Optional[int] = None) -> int:
     """Собирает карту поверх арта, отправляет полную карту + карту в рамке и сохраняет в колоду."""
     trial = bool(card_data.get("trial"))
+    if trial and "face" not in card_data:
+        # Где лицо — чтобы оставить его чистым под водяным знаком. Не нашли — типичное место на портрете.
+        try:
+            box = face_box(art)
+        except Exception:
+            logger.exception("Не удалось найти лицо на пробной картище")
+            box = None
+        if box:
+            w, h = Image.open(io.BytesIO(art)).size
+            card_data = dict(card_data, face=[round(box[0] / w, 3), round(box[1] / h, 3),
+                                              round(box[2] / w, 3), round(box[3] / h, 3)])
     with RENDER_LOCK:
         full, card_only = render_card(art, card_data, trial=trial, tag=str(chat_id))
     caption = f"{title}\n«{esc(strip_markup(card_data.get('name', '')))}» · {esc(card_data.get('faction', ''))}"
@@ -3051,7 +3063,8 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
                                       "открой «📜 Мои картищи», она уже там.")
         if trial:
             note = ("🎁 <b>Это пробная картища</b> — поэтому на ней водяные знаки Лавка.\n"
-                    f"Жми «Чистая картища» ниже — за {GENERATION_PRICE}⭐ Лавк сотрёт надписи с этой же картищи.")
+                    f"За {GENERATION_PRICE}⭐ Лавк сотрёт надписи с этой же картищи, а за {ANIM_PRICE}⭐ — оживит её "
+                    "и сотрёт надписи в подарок.")
         else:
             note = ("🃏 Картища легла в твою колоду — ищи её в «Моих картищах».\n"
                     "<i>Вторая картинка — сама карта в рамке, удобно для аватарки.</i>")
@@ -3059,7 +3072,7 @@ def deliver_card(chat_id: int, art: bytes, card_data: dict, title: str, status,
         bot.send_message(chat_id, note, reply_markup=get_main_menu(chat_id))
         if trial:
             send_example_video(chat_id)
-        action = ("Снять водяные знаки?" if trial
+        action = ("Снять водяные знаки или сразу оживить?" if trial
                   else f"Поправить арт или оживить картищу — с движением и звуком?\n"
                        f"<i>Правки и анимация доступны {plural_days(CARD_TTL_DAYS)} — потом исходник стирается.</i>")
         bot.send_message(chat_id, f"✏️ {action}", reply_markup=card_markup({"id": card_id, "data": card_data}))
@@ -3566,6 +3579,8 @@ def animate_card(chat_id: int, card_id: int, mode: str):
             logger.warning("Telegram не подтвердил доставку видео для %s: %s", chat_id, e.__class__.__name__)
         safe_call(bot.delete_message, chat_id, status.message_id)
         data = dict(card["data"], video_file_id=file_id)
+        # Оживили пробную — водяные знаки снимаются в подарок.
+        was_trial = bool(data.pop("trial", None))
         if gif:
             # Видео уже у человека — сбой GIF не должен вести к возврату звёзд.
             try:
@@ -3573,6 +3588,9 @@ def animate_card(chat_id: int, card_id: int, mode: str):
             except Exception:
                 logger.exception("Не удалось отправить GIF картищи %s", card_id)
         db.update_card_data(card_id, data)
+        if was_trial:
+            logger.info("Картища %s пользователя %s стала чистой после анимации", card_id, chat_id)
+            send_unlocked_card(chat_id, card_id)
         try:
             if not file_id:
                 bot.send_message(chat_id, "📨 Telegram долго принимал видео. Если оно не пришло выше — "
@@ -3597,7 +3615,7 @@ def send_anim_invoice(chat_id: int, card_id: int):
         bot.send_invoice(
             chat_id,
             title="Живая картища",
-            description="Анимированная карта уровня CD PROJEKT RED.",
+            description="Живая картища: движение и звук. С пробной — водяные знаки снимутся в подарок.",
             invoice_payload=f"anim:{chat_id}:{card_id}:{ANIM_PRICE}",
             provider_token="",
             currency="XTR",
@@ -3612,8 +3630,6 @@ def anim_blocker(chat_id: int, card: Optional[dict]) -> Optional[str]:
     """Почему эту картищу сейчас нельзя оживить (None — можно)."""
     if card is None:
         return "Такой картищи нет в твоей колоде."
-    if card["data"].get("trial"):
-        return "Сначала сними водяные знаки — кнопка «Чистая картища»!"
     if not has_clean_art(card):
         return expired_text()
     if not card_video.ffmpeg_available():
