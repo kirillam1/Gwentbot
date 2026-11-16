@@ -2696,7 +2696,8 @@ IDENTITY_PREFIX = (
     "Paint a brand-new dark fantasy portrait of the person from the reference photo. "
     "Keep their exact facial identity so they are clearly recognizable: the same gender, face shape, eyes, "
     "eyebrows, nose, lips, jawline, hairline, skin tone and apparent age; never turn a woman into a man or a man "
-    "into a woman. Do NOT copy the photo's clothes, background, lighting, "
+    "into a woman. Fantasy race traits from the description (pale skin, glowing eyes, fangs, pointed ears) and a "
+    "new facial expression are allowed. Do NOT copy the photo's clothes, background, lighting, "
     "camera angle or framing; do not include the photo itself. "
 )
 ART_MODELS = {
@@ -3025,6 +3026,11 @@ def art_direction(photo: bytes, data: dict) -> Optional[dict]:
         "standing pose) that suits a waist-up or three-quarter portrait with the face clearly visible; a concrete "
         "location with weather and lighting; and props, weapon or magic effects tied to the ability. "
         "Respect the person's real gender, age and build from the photo. Avoid modern items.\n"
+        "If the class names a creature or race (vampire, elf, dwarf, witch, werewolf, drowned, specter and so on), "
+        "make it unmistakable at first glance through clear traits — e.g. a vampire gets deathly pale skin, "
+        "glowing red eyes, visible fangs and a cold predatory look — while the face stays recognizable. "
+        "The facial expression must fit the character and the quote (menacing, proud, grim, sly), "
+        "not a friendly photo smile.\n"
         'Reply as JSON in English: {"gender": "female" or "male", "outfit": "...", "pose": "...", '
         '"background": "...", "details": "..."}, each value one or two sentences.'
     )
