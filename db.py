@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS promo_codes (
     active     INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
+-- Оплаты рублями через Tribute: сколько заплатил покупатель (в рублях) — для статистики.
+CREATE TABLE IF NOT EXISTS tribute_payments (
+    charge_id  TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    stars      INTEGER NOT NULL,
+    rub        INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS promo_uses (
     code       TEXT NOT NULL,
     user_id    INTEGER NOT NULL,
@@ -305,9 +314,21 @@ class Database:
         return self._scalar("SELECT COUNT(*) FROM cards")
 
     # ---------- статистика ----------
+    def add_tribute_payment(self, charge_id: str, user_id: int, product_id: int, stars: int, rub: int):
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tribute_payments (charge_id, user_id, product_id, stars, rub, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)", (charge_id, user_id, product_id, stars, rub, now()))
+
     def stats(self) -> dict:
         day = today()
         return {
+            "rub_count": self._scalar("SELECT COUNT(*) FROM transactions WHERE kind = 'tribute'"),
+            "rub_count_today": self._scalar(
+                "SELECT COUNT(*) FROM transactions WHERE kind = 'tribute' AND created_at >= ?", (day,)),
+            "rub_stars": self._scalar("SELECT SUM(amount) FROM transactions WHERE kind = 'tribute'"),
+            "rub": self._scalar("SELECT SUM(rub) FROM tribute_payments"),
+            "rub_today": self._scalar("SELECT SUM(rub) FROM tribute_payments WHERE created_at >= ?", (day,)),
             "users": self._scalar("SELECT COUNT(*) FROM users"),
             "users_today": self._scalar("SELECT COUNT(*) FROM users WHERE created_at >= ?", (day,)),
             "blocked": self._scalar("SELECT COUNT(*) FROM users WHERE blocked = 1"),

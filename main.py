@@ -1368,7 +1368,7 @@ def notify_admins(text: str):
         safe_call(bot.send_message, admin_id, text)
 
 
-def tribute_purchase(user_id: int, product_id: int, stars: int, charge_id: str):
+def tribute_purchase(user_id: int, product_id: int, stars: int, charge_id: str, rub: int = 0):
     if db.get_user(user_id) is None:
         # Человек ни разу не запускал бота — начислять некуда. Деньги пришли, разбираемся вручную.
         logger.error("Tribute: оплата от %s, но его нет в базе бота (товар %s, %s⭐)", user_id, product_id, stars)
@@ -1378,12 +1378,13 @@ def tribute_purchase(user_id: int, product_id: int, stars: int, charge_id: str):
     if not db.add_balance(user_id, stars, "tribute", charge_id):
         logger.info("Tribute: платёж %s уже зачислен", charge_id)
         return
-    logger.info("Tribute: +%s⭐ пользователю %s (товар %s)", stars, user_id, product_id)
+    db.add_tribute_payment(charge_id, user_id, product_id, stars, rub)
+    logger.info("Tribute: +%s⭐ пользователю %s (товар %s, %s ₽)", stars, user_id, product_id, rub)
     safe_call(send_screen, user_id, "pouch",
               f"💰 <b>Оплата прошла!</b> +{stars}⭐ в мешочек.\n"
               f"Теперь у тебя: <b>{balance_text(user_id)}</b>. Лавк уже точит кисть!",
               reply_markup=get_main_menu(user_id))
-    notify_admins(f"💳 Tribute: +{stars}⭐ пользователю <code>{user_id}</code>")
+    notify_admins(f"💳 Tribute: +{stars}⭐ пользователю <code>{user_id}</code>" + (f" · ~{rub} ₽" if rub else ""))
 
 
 def tribute_refund(user_id: int, product_id: int, stars: int, charge_id: str):
@@ -3853,7 +3854,9 @@ def cb_admin(call):
             f"🚫 Заблокировано: {s['blocked']} · ♾ Безлимит: {s['unlimited']}\n"
             f"🃏 Картищ: <b>{s['cards']}</b> (сегодня +{s['cards_today']})\n"
             f"🎬 Заказов анимации: <b>{s['anims']}</b> (сегодня +{s['anims_today']})\n"
-            f"⭐ Пополнено звёзд: <b>{s['stars']}</b> (сегодня +{s['stars_today']})\n"
+            f"⭐ Пополнено звёздами: <b>{s['stars']}⭐</b> (сегодня +{s['stars_today']})\n"
+            f"💳 Оплат рублями: <b>{s['rub_count']}</b> (сегодня +{s['rub_count_today']}) · "
+            f"<b>~{s['rub']} ₽</b> (сегодня +{s['rub_today']} ₽) · {s['rub_stars']}⭐ в мешочки\n"
             f"⏳ Рисуется сейчас: {_gen_active} из {GEN_SLOTS} · в очереди: {len(_gen_queue)}",
         )
     elif action == "feed" and len(parts) == 3 and parts[2].isdigit():

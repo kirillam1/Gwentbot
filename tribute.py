@@ -73,10 +73,11 @@ class Tribute:
                  on_refund: Callable[[int, int, int, str], None]):
         self.api_key = api_key
         self.products = products
-        self.on_purchase = on_purchase   # (telegram_user_id, product_id, stars, charge_id)
+        self.on_purchase = on_purchase   # (telegram_user_id, product_id, stars, charge_id, рублей)
         self.on_refund = on_refund
         self._prices: dict[int, str] = {}
         self._links: dict[int, str] = {}
+        self._buyer_rub: dict[int, int] = {}
         self._prices_at = 0.0
         self._lock = threading.Lock()
 
@@ -93,13 +94,24 @@ class Tribute:
                 threading.Thread(target=self._load_prices, daemon=True).start()
             return self._prices.get(product_id, "")
 
+    def buyer_rub(self, product_id: int, payload: Optional[dict] = None) -> int:
+        """Сколько рублей заплатил покупатель: по цене товара (как на кнопке), иначе из вебхука."""
+        with self._lock:
+            value = self._buyer_rub.get(product_id, 0)
+        if not value and payload and str(payload.get("currency", "")).lower() == "rub":
+            try:
+                value = sbp_price(int(payload["amount"]) / 100)
+            except (KeyError, TypeError, ValueError):
+                value = 0
+        return value
+
     def link(self, product_id: int) -> str:
         """Ссылка из API Tribute (поле link), а пока её нет — собранная по номеру товара."""
         with self._lock:
             return self._links.get(product_id) or product_link(product_id)
 
     def _load_prices(self):
-        prices, links = {}, {}
+        prices, links, buyer = {}, {}, {}
         for product_id in self.products:
             try:
                 r = requests.get(f"{API_BASE}/products/{product_id}", headers={"Api-Key": self.api_key}, timeout=15)
@@ -110,6 +122,8 @@ class Tribute:
                 stars = data.get("starsAmount") if data.get("starsAmountEnabled") else 0
                 value = sbp_price(amount / 100, int(stars or 0))
                 prices[product_id] = f"{value} {'₽' if currency == 'RUB' else currency}"
+                if currency == "RUB":
+                    buyer[product_id] = value
                 if isinstance(data.get("link"), str) and data["link"].startswith("https://"):
                     links[product_id] = data["link"]
             except Exception as e:
@@ -117,6 +131,7 @@ class Tribute:
         with self._lock:
             self._prices.update(prices)
             self._links.update(links)
+            self._buyer_rub.update(buyer)
 
     # ---------- вебхуки ----------
     def handle(self, body: bytes, signature: str) -> int:
@@ -148,7 +163,7 @@ class Tribute:
         purchase = payload.get("purchase_id") or payload.get("id") or event.get("created_at") or ""
         charge_id = f"tribute:{product_id}:{user_id}:{purchase}"
         if name == "new_digital_product":
-            self.on_purchase(user_id, product_id, stars, charge_id)
+            self.on_purchase(user_id, product_id, stars, charge_id, self.buyer_rub(product_id, payload))
         else:
             self.on_refund(user_id, product_id, stars, "refund:" + charge_id)
         return 200
