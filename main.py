@@ -1398,14 +1398,50 @@ TRIBUTE = tribute.Tribute(os.getenv("TRIBUTE_API_KEY", "").strip(),
                           tribute_purchase, tribute_refund)
 TRIBUTE_PORT = int(os.getenv("TRIBUTE_PORT", "8090"))
 
+# Сообщения «via @tribute» с кнопкой «Купить»: в ней вход в одно касание (окно Telegram «Авторизация»),
+# а оплата идёт в рублях на странице Tribute. Создать такую кнопку может только сам @tribute, поэтому
+# админ один раз делится товарами в чат с ботом, а бот пересылает нужное сообщение покупателю.
+TRIBUTE_MSGS_FILE = os.path.join(os.path.dirname(DB_PATH) or BASE_DIR, "tribute_messages.json")
+_tribute_msgs_lock = threading.Lock()
+
+
+def tribute_messages() -> dict[int, tuple[int, int]]:
+    """{звёзд: (chat_id, message_id)}"""
+    try:
+        with open(TRIBUTE_MSGS_FILE, encoding="utf-8") as f:
+            return {int(k): (int(v[0]), int(v[1])) for k, v in json.load(f).items()}
+    except (OSError, ValueError, TypeError, IndexError):
+        return {}
+
+
+def save_tribute_message(stars: int, chat_id: int, message_id: int):
+    with _tribute_msgs_lock:
+        msgs = tribute_messages()
+        msgs[stars] = (chat_id, message_id)
+        tmp = TRIBUTE_MSGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): list(v) for k, v in msgs.items()}, f)
+        os.replace(tmp, TRIBUTE_MSGS_FILE)
+
+
+def tribute_stars_in(message) -> Optional[int]:
+    """«100 звёзд в мешочек…» → 100. Только для сообщений, отправленных через @tribute."""
+    via = getattr(message, "via_bot", None)
+    if not via or (via.username or "").lower() != "tribute":
+        return None
+    text = message.text or message.caption or ""
+    m = re.match(r"\s*(\d+)\s*(зв|⭐|star)", text, re.I)
+    return int(m.group(1)) if m else None
+
+
 def add_tribute_buttons(markup):
     """Кнопки «картой / СБП» — товары Tribute, открываются прямо в Telegram."""
     if not TRIBUTE.enabled:
         return
     for product_id, stars in sorted(TRIBUTE.products.items(), key=lambda kv: kv[1]):
         price = TRIBUTE.price_label(product_id)
-        label = f"💳 {stars}⭐ за ~{price} — по СБП" if price else f"💳 {stars}⭐ — по СБП"
-        markup.add(types.InlineKeyboardButton(label, url=TRIBUTE.link(product_id)))
+        label = f"💳 {stars}⭐ за {price}" if price else f"💳 {stars}⭐ рублями"
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"rub:{stars}:{product_id}"))
 
 
 def pack_label(pay: int, credit: int) -> str:
@@ -1427,11 +1463,11 @@ def topup_choice_screen(chat_id: int):
     """Первый экран: чем платить. Без Tribute сразу показываем звёзды."""
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("⭐ Звёздами Telegram", callback_data="topmode:stars"),
-               types.InlineKeyboardButton("💳 Рублями по СБП", callback_data="topmode:rub"),
+               types.InlineKeyboardButton("💳 Рублями — картой или СБП", callback_data="topmode:rub"),
                types.InlineKeyboardButton("🎟 Промокод", callback_data="promo"))
     text = (topup_header(chat_id) + "<b>Чем будешь платить, человече?</b>\n"
             "⭐ Звёзды — если они у тебя уже есть.\n"
-            "💳 Рубли — по СБП прямо в Telegram, звёзды упадут в мешочек сами.\n\n" + TERMS_LINE)
+            "💳 Рубли — картой или СБП, звёзды упадут в мешочек сами.\n\n" + TERMS_LINE)
     return text, markup
 
 
@@ -1460,8 +1496,8 @@ def topup_rub_screen(chat_id: int):
     markup = types.InlineKeyboardMarkup(row_width=1)
     add_tribute_buttons(markup)
     markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="topmode:back"))
-    text = (topup_header(chat_id) + "💳 <b>Рублями по СБП.</b> Оплата прямо в Telegram через Tribute — "
-            "официального партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.\n"
+    text = (topup_header(chat_id) + "💳 <b>Рублями — картой или СБП.</b> Оплата через Tribute, официального "
+            "партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.\n"
             "Чем больше набор, тем дешевле звезда.\n\n" + TERMS_LINE)
     return text, markup
 
@@ -1469,6 +1505,41 @@ def topup_rub_screen(chat_id: int):
 def show_topup(chat_id: int):
     text, markup = topup_choice_screen(chat_id) if TRIBUTE.enabled else topup_stars_screen(chat_id)
     send_screen(chat_id, "topup", text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rub:"))
+def cb_rub_pack(call):
+    chat_id = call.message.chat.id
+    safe_call(bot.answer_callback_query, call.id)
+    parts = call.data.split(":")
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return
+    stars, product_id = int(parts[1]), int(parts[2])
+    saved = tribute_messages().get(stars)
+    if saved:
+        try:
+            bot.forward_message(chat_id, saved[0], saved[1])
+            bot.send_message(chat_id, "☝️ Жми <b>«Купить»</b> → Telegram спросит разрешение на вход → <b>«Войти»</b> → "
+                                      "плати картой или по СБП. Звёзды упадут в мешочек сами, Лавк напишет.")
+            return
+        except apihelper.ApiTelegramException as e:
+            logger.warning("Tribute: не удалось переслать товар %s⭐ (%s) — даю ссылку", stars, e)
+    # Запасной путь: товар в мини-приложении Tribute (там оплата звёздами или СБП через звёзды).
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(f"💳 Купить {stars}⭐", url=TRIBUTE.link(product_id)))
+    bot.send_message(chat_id, "Открой товар и оплати — звёзды упадут в мешочек сами.", reply_markup=markup)
+
+
+@bot.message_handler(func=lambda msg: is_admin(msg.from_user.id) and tribute_stars_in(msg) is not None,
+                     content_types=["text", "photo", "video", "animation", "document"])
+def remember_tribute_product(message):
+    stars = tribute_stars_in(message)
+    save_tribute_message(stars, message.chat.id, message.message_id)
+    known = ", ".join(f"{s}⭐" for s in sorted(tribute_messages()))
+    note = "" if stars in TRIBUTE.products.values() else (
+        "\n⚠️ Такого пакета нет в TRIBUTE_PRODUCTS — запусти tribute-setup.sh, иначе звёзды не начислятся.")
+    bot.reply_to(message, f"✅ Запомнил товар на {stars}⭐ — покупатели получат это сообщение с кнопкой «Купить». "
+                          f"Не удаляй его.\nСейчас запомнены: {known}{note}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("topmode:"))

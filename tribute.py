@@ -119,8 +119,7 @@ class Tribute:
                 data = r.json()
                 data = data.get("data", data) if isinstance(data, dict) else data
                 amount, currency = int(data["amount"]), str(data.get("currency", "RUB")).upper()
-                stars = data.get("starsAmount") if data.get("starsAmountEnabled") else 0
-                value = sbp_price(amount / 100, int(stars or 0))
+                value = round(amount / 100)  # картой/СБП на странице Tribute платят ровно цену товара
                 prices[product_id] = f"{value} {'₽' if currency == 'RUB' else currency}"
                 if currency == "RUB":
                     buyer[product_id] = value
