@@ -2984,6 +2984,42 @@ def cleanup_old_files() -> tuple[int, int]:
     return removed, freed
 
 
+# ---------- баланс fal ----------
+FAL_LOW_BALANCE = float(os.getenv("FAL_LOW_BALANCE", "10"))
+FAL_CHECK_EVERY = 30 * 60          # проверка раз в 30 минут
+FAL_ALERT_EVERY = 6 * 3600         # напоминание не чаще раза в 6 часов, пока баланс низкий
+
+
+def fal_balance() -> Optional[float]:
+    """Остаток на fal в долларах; None — fal не ответил (например, ключ без прав на биллинг)."""
+    if not FAL_KEY:
+        return None
+    try:
+        r = requests.get("https://api.fal.ai/v1/account/billing", params={"expand": "credits"},
+                         headers={"Authorization": f"Key {FAL_KEY}", "Accept": "application/json"}, timeout=20)
+        r.raise_for_status()
+        return float(r.json()["credits"]["current_balance"])
+    except (requests.RequestException, KeyError, TypeError, ValueError) as e:
+        logger.warning("Не удалось узнать баланс fal: %s", e)
+        return None
+
+
+def fal_balance_loop():
+    last_alert = 0.0
+    while True:
+        balance = fal_balance()
+        if balance is not None:
+            if balance < FAL_LOW_BALANCE and time.time() - last_alert > FAL_ALERT_EVERY:
+                last_alert = time.time()
+                logger.warning("Баланс fal низкий: $%.2f", balance)
+                notify_admins(f"⚠️ <b>На fal осталось ${balance:.2f}</b> — это примерно "
+                              f"{int(balance / 0.08)} картищ или {int(balance / 1.2)} анимаций.\n"
+                              "Пополни баланс, пока генерации не встали: fal.ai → Billing.")
+            elif balance >= FAL_LOW_BALANCE:
+                last_alert = 0.0
+        time.sleep(FAL_CHECK_EVERY)
+
+
 def cleanup_loop():
     while True:
         try:
@@ -4038,7 +4074,9 @@ def cb_admin(call):
             f"⭐ Пополнено звёздами: <b>{s['stars']}⭐</b> (сегодня +{s['stars_today']})\n"
             f"💳 Оплат рублями: <b>{s['rub_count']}</b> (сегодня +{s['rub_count_today']}) · "
             f"<b>~{s['rub']} ₽</b> (сегодня +{s['rub_today']} ₽) · {s['rub_stars']}⭐ в мешочки\n"
-            f"⏳ Рисуется сейчас: {_gen_active} из {GEN_SLOTS} · в очереди: {len(_gen_queue)}",
+            f"⏳ Рисуется сейчас: {_gen_active} из {GEN_SLOTS} · в очереди: {len(_gen_queue)}\n"
+            + (lambda b: f"💵 Баланс fal: <b>${b:.2f}</b>" if b is not None else "💵 Баланс fal: не удалось узнать")(
+                fal_balance()),
         )
     elif action == "feed" and len(parts) == 3 and parts[2].isdigit():
         show_admin_feed(chat_id, int(parts[2]), message=call.message if parts[2] != "0" else None)
@@ -4475,6 +4513,7 @@ if __name__ == "__main__":
     warm_scenes_async()
     # Раз в час стираем исходники старше CARD_TTL_DAYS, чтобы не забился диск.
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=fal_balance_loop, daemon=True).start()
     if TRIBUTE.enabled:
         TRIBUTE.serve(TRIBUTE_PORT)
         TRIBUTE.price_label(0)  # подтянуть цены для кнопок заранее
