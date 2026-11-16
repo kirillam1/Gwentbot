@@ -2992,11 +2992,13 @@ FAL_ALERT_EVERY = 6 * 3600         # напоминание не чаще раз
 
 def fal_balance() -> Optional[float]:
     """Остаток на fal в долларах; None — fal не ответил (например, ключ без прав на биллинг)."""
-    if not FAL_KEY:
+    # Биллинг отдаётся только ключу с правами администратора — его можно завести отдельно от ключа для моделей.
+    key = os.getenv("FAL_ADMIN_KEY") or FAL_KEY
+    if not key:
         return None
     try:
         r = requests.get("https://api.fal.ai/v1/account/billing", params={"expand": "credits"},
-                         headers={"Authorization": f"Key {FAL_KEY}", "Accept": "application/json"}, timeout=20)
+                         headers={"Authorization": f"Key {key}", "Accept": "application/json"}, timeout=20)
         r.raise_for_status()
         return float(r.json()["credits"]["current_balance"])
     except (requests.RequestException, KeyError, TypeError, ValueError) as e:
