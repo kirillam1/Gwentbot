@@ -2636,6 +2636,8 @@ ART_SCENE = (
     "knuckles and proportions; hands are relaxed or firmly gripping, partly in shadow or gloved where it suits the outfit. "
     "A fully painted richly detailed environment behind the character fills the whole image with depth, "
     "foreground and background elements, atmospheric perspective, no plain or empty backdrop. "
+    "No decorative glowing smoke, colored mist or energy swirls around the character unless the description "
+    "explicitly asks for magic. "
     # Отрицательный промпт при true_cfg=1 моделью игнорируется, поэтому запреты — прямо в описании.
     "Not anime, not manga, not cartoon, not cel-shaded, no glossy airbrushed skin, no big shiny eyes."
 )
@@ -3024,7 +3026,10 @@ def art_direction(photo: bytes, data: dict) -> Optional[dict]:
         "Invent ONE vivid, specific concept that clearly shows the class and the ability: a distinctive outfit "
         "with concrete materials, colors and accessories; a dynamic, expressive pose or action (not a generic "
         "standing pose) that suits a waist-up or three-quarter portrait with the face clearly visible; a concrete "
-        "location with weather and lighting; and props, weapon or magic effects tied to the ability. "
+        "location with weather and lighting; and props or a weapon tied to the ability. "
+        "Magic effects (glowing smoke, swirling energy, auras, colored mist around the character) only if the class "
+        "is a mage, sorcerer, witch, priest or spirit, or the ability is clearly a spell — otherwise none; "
+        "show the ability through props, wounds, blood or the scene instead. "
         "Respect the person's real gender, age and build from the photo. Avoid modern items.\n"
         "If the class names a creature or race (vampire, elf, dwarf, witch, werewolf, drowned, specter and so on), "
         "make it unmistakable at first glance through clear traits — e.g. a vampire gets deathly pale skin, "
