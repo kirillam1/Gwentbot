@@ -1463,11 +1463,11 @@ def topup_choice_screen(chat_id: int):
     """Первый экран: чем платить. Без Tribute сразу показываем звёзды."""
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("⭐ Звёздами Telegram", callback_data="topmode:stars"),
-               types.InlineKeyboardButton("💳 Рублями — картой", callback_data="topmode:rub"),
+               types.InlineKeyboardButton("💳 Рублями", callback_data="topmode:rub"),
                types.InlineKeyboardButton("🎟 Промокод", callback_data="promo"))
     text = (topup_header(chat_id) + "<b>Чем будешь платить, человече?</b>\n"
             "⭐ Звёзды — если они у тебя уже есть.\n"
-            "💳 Рубли — картой любого российского банка, звёзды упадут в мешочек сами.\n\n" + TERMS_LINE)
+            "💳 Рубли — картой российского банка или по СБП, звёзды упадут в мешочек сами.\n\n" + TERMS_LINE)
     return text, markup
 
 
@@ -1496,7 +1496,7 @@ def topup_rub_screen(chat_id: int):
     markup = types.InlineKeyboardMarkup(row_width=1)
     add_tribute_buttons(markup)
     markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="topmode:back"))
-    text = (topup_header(chat_id) + "💳 <b>Рублями — картой.</b> Оплата через Tribute, официального "
+    text = (topup_header(chat_id) + "💳 <b>Рублями.</b> Оплата через Tribute, официального "
             "партнёра Telegram. Звёзды упадут в мешочек сами, сразу после оплаты.\n"
             "Чем больше набор, тем дешевле звезда.\n\n" + TERMS_LINE)
     return text, markup
@@ -1520,7 +1520,7 @@ def cb_rub_pack(call):
         try:
             bot.forward_message(chat_id, saved[0], saved[1])
             bot.send_message(chat_id, "☝️ Жми <b>«Купить»</b> → Telegram спросит разрешение на вход → <b>«Войти»</b> → "
-                                      "выбери <b>«Российская карта»</b> и плати. Звёзды упадут в мешочек сами, "
+                                      "плати по <b>СБП</b>, а если её нет в списке — выбери <b>«Российская карта»</b>. Звёзды упадут в мешочек сами, "
                                       "Лавк напишет.")
             return
         except apihelper.ApiTelegramException as e:
